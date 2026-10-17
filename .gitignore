@@ -1,0 +1,15 @@
+node_modules/
+dist/
+apps/api/.wrangler/
+*.tsbuildinfo
+.dev-*.log
+.dev-*.err.log
+.dev.vars
+.env
+.env.*
+!.env.example
+openwa/.env
+openwa/data/
+output/
+tmp/
+.playwright-cli/

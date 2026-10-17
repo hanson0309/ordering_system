@@ -1,0 +1,24 @@
+{
+  "name": "ordering-system",
+  "private": true,
+  "version": "0.0.1",
+  "workspaces": [
+    "apps/store",
+    "apps/dashboard",
+    "apps/api"
+  ],
+  "scripts": {
+    "dev:store": "npm run dev --workspace apps/store",
+    "dev:dashboard": "npm run dev --workspace apps/dashboard",
+    "dev:api": "npm run dev --workspace apps/api",
+    "build:store": "npm run build --workspace apps/store",
+    "build:dashboard": "npm run build --workspace apps/dashboard",
+    "build:api": "npm run build --workspace apps/api",
+    "test": "npm run test --workspace apps/api",
+    "db:generate": "npm run db:generate --workspace apps/api",
+    "db:migrate:local": "npm run db:migrate:local --workspace apps/api"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

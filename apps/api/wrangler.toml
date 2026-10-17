@@ -1,0 +1,51 @@
+name = "ordering-system-api"
+main = "src/index.ts"
+compatibility_date = "2026-10-13"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+
+# Local/dev environment. Override per-environment below for production.
+[[d1_databases]]
+binding = "DB"
+database_name = "ordering_system_db"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+migrations_dir = "src/db/migrations"
+
+[[r2_buckets]]
+binding = "DOCS_BUCKET"
+bucket_name = "ordering-system-docs-dev"
+
+[vars]
+ENVIRONMENT = "development"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+# -----------------------------------------------------------------------------
+# Production environment — deploy with: wrangler deploy --env production
+# -----------------------------------------------------------------------------
+[env.production]
+name = "ordering-system-api-prod"
+
+[[env.production.d1_databases]]
+binding = "DB"
+database_name = "ordering_system_db_prod"
+database_id = "REPLACE_WITH_PROD_D1_DATABASE_ID"
+migrations_dir = "src/db/migrations"
+
+[[env.production.r2_buckets]]
+binding = "DOCS_BUCKET"
+bucket_name = "ordering-system-docs-prod"
+
+[env.production.vars]
+ENVIRONMENT = "production"
+
+[env.production.triggers]
+crons = ["*/5 * * * *"]
+
+# Secrets (set via `wrangler secret put <NAME>` — never committed):
+#   SESSION_SIGNING_SECRET   - signs/verifies session cookies
+#   TELEGRAM_BOT_TOKEN       - Bot token issued by BotFather
+#   TELEGRAM_CHAT_ID         - single Telegram user/chat that receives order PDFs
