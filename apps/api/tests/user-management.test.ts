@@ -88,4 +88,78 @@ describe('dashboard user management', () => {
     expect(membershipsInTenant).toHaveLength(2)
     expect(hidden).toBeTruthy()
   })
+
+  it('allows an owner to change another member role and reset their password', async () => {
+    const tenant = await createTenant('User Store', 'user-management-edit')
+    const owner = await createUser('user-management-edit-owner@example.com')
+    const member = await createUser('user-management-edit-member@example.com', 'old-password-123')
+    await addMembership(owner, tenant, 'owner')
+    await addMembership(member, tenant, 'staff')
+    const cookie = await loginAndGetCookie('user-management-edit-owner@example.com')
+    const memberCookie = await loginAndGetCookie('user-management-edit-member@example.com', 'old-password-123')
+
+    const update = await SELF.fetch(`https://test.local/api/dashboard/users/${member}`, {
+      method: 'PATCH',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'admin', password: 'new-password-123' }),
+    })
+
+    expect(update.status).toBe(200)
+    await expect(update.json()).resolves.toMatchObject({ user: { id: member, role: 'admin' } })
+    const oldSessionRequest = await SELF.fetch('https://test.local/api/dashboard/orders', { headers: { cookie: memberCookie } })
+    expect(oldSessionRequest.status).toBe(401)
+    const oldLogin = await SELF.fetch('https://test.local/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'user-management-edit-member@example.com', password: 'old-password-123' }),
+    })
+    expect(oldLogin.status).toBe(401)
+    const newCookie = await loginAndGetCookie('user-management-edit-member@example.com', 'new-password-123')
+    expect(newCookie).toContain('session=')
+  })
+
+  it('does not allow an owner to edit their own role or password', async () => {
+    const tenant = await createTenant('User Store', 'user-management-self')
+    const owner = await createUser('user-management-self-owner@example.com', 'owner-password-123')
+    await addMembership(owner, tenant, 'owner')
+    const cookie = await loginAndGetCookie('user-management-self-owner@example.com', 'owner-password-123')
+
+    const update = await SELF.fetch(`https://test.local/api/dashboard/users/${owner}`, {
+      method: 'PATCH',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'staff', password: 'changed-password-123' }),
+    })
+
+    expect(update.status).toBe(403)
+    await expect(update.json()).resolves.toEqual({ error: 'cannot_edit_self' })
+    expect((await loginAndGetCookie('user-management-self-owner@example.com', 'owner-password-123'))).toContain('session=')
+  })
+
+  it('rejects account edits from non-owners and rejects owner role assignment', async () => {
+    const tenant = await createTenant('User Store', 'user-management-edit-permissions')
+    const admin = await createUser('user-management-edit-admin@example.com')
+    const member = await createUser('user-management-edit-target@example.com')
+    await addMembership(admin, tenant, 'admin')
+    await addMembership(member, tenant, 'staff')
+    const adminCookie = await loginAndGetCookie('user-management-edit-admin@example.com')
+
+    const forbidden = await SELF.fetch(`https://test.local/api/dashboard/users/${member}`, {
+      method: 'PATCH',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'viewer' }),
+    })
+    expect(forbidden.status).toBe(403)
+    await expect(forbidden.json()).resolves.toEqual({ error: 'insufficient_role' })
+
+    const owner = await createUser('user-management-edit-permissions-owner@example.com')
+    await addMembership(owner, tenant, 'owner')
+    const ownerCookie = await loginAndGetCookie('user-management-edit-permissions-owner@example.com')
+    const invalidRole = await SELF.fetch(`https://test.local/api/dashboard/users/${member}`, {
+      method: 'PATCH',
+      headers: { cookie: ownerCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ role: 'owner' }),
+    })
+    expect(invalidRole.status).toBe(400)
+    await expect(invalidRole.json()).resolves.toEqual({ error: 'invalid_input' })
+  })
 })

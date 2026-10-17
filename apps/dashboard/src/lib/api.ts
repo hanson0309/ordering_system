@@ -36,6 +36,7 @@ export interface DashboardUser {
   id: string
   email: string
   role: 'owner' | 'admin' | 'staff' | 'viewer'
+  isCurrentUser?: boolean
 }
 
 export interface DashboardSummary {
@@ -169,6 +170,13 @@ export function getDashboardUsers() {
 export function createDashboardUser(input: { email: string; password: string; role: 'admin' | 'staff' | 'viewer' }) {
   return request<{ user: DashboardUser; membership: { id: string; tenantId: string; role: DashboardUser['role'] } }>('/dashboard/users', {
     method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function updateDashboardUser(userId: string, input: { role?: 'admin' | 'staff' | 'viewer'; password?: string }) {
+  return request<{ user: DashboardUser; updated: { role: boolean; password: boolean } }>(`/dashboard/users/${encodeURIComponent(userId)}`, {
+    method: 'PATCH',
     body: JSON.stringify(input),
   })
 }

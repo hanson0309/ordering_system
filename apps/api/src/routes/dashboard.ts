@@ -14,6 +14,7 @@ import {
   orderItems,
   orders,
   products,
+  sessions,
   tenantSettings,
   tenants,
   users,
@@ -87,6 +88,11 @@ const createDashboardUserSchema = z.object({
   role: z.enum(['admin', 'staff', 'viewer']),
 })
 
+const updateDashboardUserSchema = z.object({
+  role: z.enum(['admin', 'staff', 'viewer']).optional(),
+  password: z.string().min(8).max(200).optional(),
+}).refine((value) => value.role !== undefined || value.password !== undefined)
+
 dashboardRoutes.get('/users', requireRole('owner'), async (c) => {
   const tenantId = c.get('tenant').tenantId
   const rows = await createDb(c.env)
@@ -95,7 +101,8 @@ dashboardRoutes.get('/users', requireRole('owner'), async (c) => {
     .innerJoin(users, eq(users.id, memberships.userId))
     .where(eq(memberships.tenantId, tenantId))
     .orderBy(asc(users.email))
-  return c.json({ users: rows })
+  const currentUserId = c.get('auth').userId
+  return c.json({ users: rows.map((row) => ({ ...row, isCurrentUser: row.id === currentUserId })) })
 })
 
 dashboardRoutes.post('/users', requireRole('owner'), async (c) => {
@@ -125,6 +132,40 @@ dashboardRoutes.post('/users', requireRole('owner'), async (c) => {
     user: { id: userId, email, role: parsed.data.role },
     membership: { id: membershipId, tenantId, role: parsed.data.role },
   }, 201)
+})
+
+dashboardRoutes.patch('/users/:userId', requireRole('owner'), async (c) => {
+  const parsed = updateDashboardUserSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+
+  const auth = c.get('auth')
+  const userId = c.req.param('userId')
+  if (userId === auth.userId) return c.json({ error: 'cannot_edit_self' }, 403)
+
+  const tenantId = c.get('tenant').tenantId
+  const db = createDb(c.env)
+  const [target] = await db
+    .select({ userId: memberships.userId, email: users.email, role: memberships.role })
+    .from(memberships)
+    .innerJoin(users, eq(users.id, memberships.userId))
+    .where(and(eq(memberships.tenantId, tenantId), eq(memberships.userId, userId)))
+    .limit(1)
+  if (!target) return c.json({ error: 'not_found' }, 404)
+
+  const statements: any[] = []
+  if (parsed.data.role !== undefined) {
+    statements.push(db.update(memberships).set({ role: parsed.data.role }).where(and(eq(memberships.tenantId, tenantId), eq(memberships.userId, userId))))
+  }
+  if (parsed.data.password !== undefined) {
+    statements.push(db.update(users).set({ passwordHash: await hashPassword(parsed.data.password) }).where(eq(users.id, userId)))
+    statements.push(db.delete(sessions).where(eq(sessions.userId, userId)))
+  }
+  await db.batch(statements as [any, ...any[]])
+
+  return c.json({
+    user: { id: userId, email: target.email, role: parsed.data.role ?? target.role },
+    updated: { role: parsed.data.role !== undefined, password: parsed.data.password !== undefined },
+  })
 })
 
 const branchSchema = z.object({

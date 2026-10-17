@@ -14,6 +14,7 @@ import {
   getDashboardSettings,
   getDashboardUsers,
   createDashboardUser,
+  updateDashboardUser,
   getDashboardSummary,
   getOrganizations,
   logout,
@@ -467,6 +468,9 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
   const [role, setRole] = useState<'admin' | 'staff' | 'viewer'>('staff')
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingRole, setEditingRole] = useState<'admin' | 'staff' | 'viewer'>('staff')
+  const [editingPassword, setEditingPassword] = useState('')
 
   async function createUser(event: FormEvent) {
     event.preventDefault()
@@ -487,6 +491,29 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
     }
   }
 
+  function startEditing(user: DashboardUser) {
+    setEditingId(user.id)
+    setEditingRole(user.role === 'owner' ? 'staff' : user.role)
+    setEditingPassword('')
+    setError(null)
+  }
+
+  async function saveUser(user: DashboardUser) {
+    setSaving(true)
+    setError(null)
+    try {
+      await updateDashboardUser(user.id, { ...(user.role === 'owner' ? {} : { role: editingRole }), ...(editingPassword ? { password: editingPassword } : {}) })
+      setEditingId(null)
+      setEditingPassword('')
+      await onCreated()
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'invalid_input') setError(t('Enter a valid role and password.'))
+      else setError(t('Role and password update failed.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return <div className="space-y-6">
     <section className="max-w-2xl rounded-xl border border-slate-200 bg-white p-5">
       <h2 className="font-semibold">{t('User management')}</h2>
@@ -501,7 +528,7 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
     </section>
     <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
       <div className="border-b border-slate-200 px-4 py-4"><h3 className="font-semibold">{t('Organization accounts')}</h3></div>
-      <div className="divide-y divide-slate-100">{users.map((user) => <div key={user.id} className="flex items-center justify-between gap-3 px-4 py-3"><span className="break-all text-sm font-medium">{user.email}</span><span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">{t(user.role === 'owner' ? 'Store owner' : user.role[0].toUpperCase() + user.role.slice(1))}</span></div>)}</div>
+      <div className="divide-y divide-slate-100">{users.map((user) => editingId === user.id ? <div key={user.id} className="space-y-3 bg-slate-50 px-4 py-3"><p className="break-all text-sm font-medium">{user.email}</p><div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto_auto]"><select disabled={user.role === 'owner'} value={editingRole} onChange={(event) => setEditingRole(event.target.value as typeof editingRole)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100"><option value="admin">{t('Admin')}</option><option value="staff">{t('Staff')}</option><option value="viewer">{t('Viewer')}</option></select><input type="password" value={editingPassword} onChange={(event) => setEditingPassword(event.target.value)} minLength={8} placeholder={t('Password (leave blank to keep current)')} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" /><button type="button" disabled={saving || (editingPassword.length > 0 && editingPassword.length < 8)} onClick={() => void saveUser(user)} className="rounded-lg bg-slate-950 px-3 py-2 text-sm font-medium text-white disabled:opacity-50">{t('Save changes')}</button><button type="button" disabled={saving} onClick={() => setEditingId(null)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700">{t('Cancel')}</button></div></div> : <div key={user.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div className="min-w-0"><span className="break-all text-sm font-medium">{user.email}</span>{user.isCurrentUser && <span className="ml-2 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">{t('Your account')}</span>}</div><div className="flex items-center gap-2"><span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">{t(user.role === 'owner' ? 'Store owner' : user.role[0].toUpperCase() + user.role.slice(1))}</span>{!user.isCurrentUser && <button type="button" onClick={() => startEditing(user)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">{t('Edit')}</button>}</div></div>)}</div>
     </section>
   </div>
 }
