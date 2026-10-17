@@ -10,15 +10,15 @@ import type { Env, AppVariables } from './types'
 const app = new Hono<{ Bindings: Env; Variables: AppVariables }>()
 
 // CORS is intentionally narrow: only the storefront/dashboard origin may
-// call this API with credentials. Adjust allowed origins per environment
-// via the dashboard — do not widen to "*" since cookies are credentialed.
+// call this API with credentials. Production traffic is also proxied through
+// Pages on this same origin via a Service Binding; do not widen to "*".
 app.use(
   '*',
   cors({
     origin: (origin, c) => {
       const allowed =
         c.env.ENVIRONMENT === 'production'
-          ? ['https://app.example.com']
+          ? ['https://ordering-system-ars.pages.dev']
           : ['http://localhost:5173']
       return origin && allowed.includes(origin) ? origin : null
     },

@@ -1,0 +1,7 @@
+name = "ordering-system"
+compatibility_date = "2026-10-17"
+pages_build_output_dir = "./dist"
+
+[[services]]
+binding = "API"
+service = "ordering-system-api-prod"

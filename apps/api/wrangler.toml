@@ -10,7 +10,7 @@ enabled = true
 [[d1_databases]]
 binding = "DB"
 database_name = "ordering_system_db"
-database_id = "REPLACE_WITH_D1_DATABASE_ID"
+database_id = "103db9aa-fe73-407e-85b5-1ed5dadbbf5e"
 migrations_dir = "src/db/migrations"
 
 [[r2_buckets]]
@@ -32,7 +32,7 @@ name = "ordering-system-api-prod"
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "ordering_system_db_prod"
-database_id = "REPLACE_WITH_PROD_D1_DATABASE_ID"
+database_id = "54740c89-6eb5-4afa-9acf-fa84d8ed65c2"
 migrations_dir = "src/db/migrations"
 
 [[env.production.r2_buckets]]
