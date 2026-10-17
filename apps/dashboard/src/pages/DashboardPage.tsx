@@ -12,6 +12,8 @@ import {
   sendDashboardOrderListNow,
   getDashboardProducts,
   getDashboardSettings,
+  getDashboardUsers,
+  createDashboardUser,
   getDashboardSummary,
   getOrganizations,
   logout,
@@ -35,12 +37,13 @@ import type {
   DashboardAnalyticsPeriod,
   DashboardOrder,
   Organization,
+  DashboardUser,
 } from '../lib/api'
 import { LanguageToggle, useLanguage } from '../lib/i18n'
 import { compressImage } from '../lib/image'
 import { buildLocationLink } from '../lib/locationLink'
 
-type Tab = 'overview' | 'orders' | 'catalog' | 'stores' | 'settings'
+type Tab = 'overview' | 'orders' | 'catalog' | 'stores' | 'settings' | 'users'
 export default function DashboardPage() {
   const { t } = useLanguage()
   const navigate = useNavigate()
@@ -56,6 +59,7 @@ export default function DashboardPage() {
   const [branches, setBranches] = useState<DashboardBranch[]>([])
   const [activeBranchId, setActiveBranchId] = useState<string | null>(null)
   const [settings, setSettings] = useState<DashboardSettings | null>(null)
+  const [dashboardUsers, setDashboardUsers] = useState<DashboardUser[]>([])
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -89,18 +93,21 @@ export default function DashboardPage() {
         ? activeBranchId
         : branchRes.branches.find((branch) => branch.isDefault)?.id ?? branchRes.branches[0]?.id ?? null
       setActiveBranchId(selectedBranchId)
-      const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes] = await Promise.all([
+      const currentOrganization = orgs.organizations.find((organization) => organization.tenantId === (orgs.activeTenantId ?? orgs.organizations[0]?.tenantId))
+      const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes, usersRes] = await Promise.all([
         getDashboardSummary(selectedBranchId, analyticsPeriod),
         getDashboardOrders({ limit: 50, branchId: selectedBranchId }),
         getDashboardProducts(selectedBranchId),
         getDashboardCategories(selectedBranchId),
         getDashboardSettings(),
+        currentOrganization?.role === 'owner' ? getDashboardUsers() : Promise.resolve({ users: [] as DashboardUser[] }),
       ])
       setSummary(summaryRes)
       setOrders(ordersRes.orders)
       setProducts(productsRes.products)
       setCategories(categoriesRes.categories)
       setSettings(settingsRes)
+      setDashboardUsers(usersRes.users)
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
         navigate('/dashboard/login', { replace: true })
@@ -224,7 +231,7 @@ export default function DashboardPage() {
 
       <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:flex-row">
         <nav aria-label={t('Dashboard navigation')} className="flex gap-2 overflow-x-auto lg:w-44 lg:flex-col">
-          {([['overview', 'Overview'], ['orders', 'Orders'], ['catalog', 'Product catalog'], ['stores', 'Store management'], ['settings', 'Organization settings']] as const).map(([key, label]) => (
+          {([['overview', 'Overview'], ['orders', 'Orders'], ['catalog', 'Product catalog'], ['stores', 'Store management'], ['settings', 'Organization settings'], ...(activeOrganization.role === 'owner' ? [['users', 'User management'] as const] : [])] as const).map(([key, label]) => (
             <button key={key} type="button" onClick={() => setTab(key)} className={`whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-medium ${tab === key ? 'bg-slate-950 text-white' : 'text-slate-600 hover:bg-white'}`}>
               {t(label)}
             </button>
@@ -240,6 +247,7 @@ export default function DashboardPage() {
           {tab === 'catalog' && <Catalog products={products} categories={categories} branchId={activeBranchId} canManage={canManageCatalog} onCreated={loadDashboard} />}
           {tab === 'stores' && <Stores organizations={organizations} activeTenantId={activeTenantId} branches={branches} canCreate={activeOrganization.role === 'owner'} canManage={canManageCatalog} onCreated={async (tenantId) => { await handleOrganizationChange(tenantId) }} onBranchesChanged={loadDashboard} />}
           {tab === 'settings' && <Settings settings={settings} canManage={canManageCatalog} onSaved={loadDashboard} />}
+          {tab === 'users' && activeOrganization.role === 'owner' && <Users users={dashboardUsers} onCreated={async () => { const result = await getDashboardUsers(); setDashboardUsers(result.users) }} />}
         </main>
       </div>
     </div>
@@ -450,4 +458,50 @@ function Settings({ settings, canManage, onSaved }: { settings: DashboardSetting
     {error && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
     {canManage && <button type="submit" disabled={saving || !storeName.trim() || !storeSlug.trim()} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{saving ? t('Saving...') : t('Save settings')}</button>}
   </form></section>
+}
+
+function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => Promise<void> }) {
+  const { t } = useLanguage()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [role, setRole] = useState<'admin' | 'staff' | 'viewer'>('staff')
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  async function createUser(event: FormEvent) {
+    event.preventDefault()
+    setSaving(true)
+    setError(null)
+    try {
+      await createDashboardUser({ email: email.trim(), password, role })
+      setEmail('')
+      setPassword('')
+      setRole('staff')
+      await onCreated()
+    } catch (err) {
+      if (err instanceof ApiError && err.code === 'email_taken') setError(t('This email is already in use.'))
+      else if (err instanceof ApiError && err.code === 'invalid_input') setError(t('Enter a valid email, password, and role.'))
+      else setError(t('Account creation failed.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return <div className="space-y-6">
+    <section className="max-w-2xl rounded-xl border border-slate-200 bg-white p-5">
+      <h2 className="font-semibold">{t('User management')}</h2>
+      <p className="mt-1 text-sm text-slate-500">{t('Only the organization owner can add dashboard accounts.')}</p>
+      <form onSubmit={createUser} className="mt-5 space-y-4">
+        <label className="block text-sm font-medium">{t('Email')}<input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2.5 font-normal" /></label>
+        <label className="block text-sm font-medium">{t('Password')}<input required minLength={8} type="password" value={password} onChange={(event) => setPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2.5 font-normal" /><span className="mt-1 block text-xs font-normal text-slate-400">{t('At least 8 characters.')}</span></label>
+        <label className="block text-sm font-medium">{t('Account role')}<select value={role} onChange={(event) => setRole(event.target.value as typeof role)} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2.5 font-normal"><option value="admin">{t('Admin')}</option><option value="staff">{t('Staff')}</option><option value="viewer">{t('Viewer')}</option></select></label>
+        {error && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+        <button type="submit" disabled={saving || !email.trim() || password.length < 8} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{saving ? t('Creating...') : t('Add account')}</button>
+      </form>
+    </section>
+    <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
+      <div className="border-b border-slate-200 px-4 py-4"><h3 className="font-semibold">{t('Organization accounts')}</h3></div>
+      <div className="divide-y divide-slate-100">{users.map((user) => <div key={user.id} className="flex items-center justify-between gap-3 px-4 py-3"><span className="break-all text-sm font-medium">{user.email}</span><span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">{t(user.role === 'owner' ? 'Store owner' : user.role[0].toUpperCase() + user.role.slice(1))}</span></div>)}</div>
+    </section>
+  </div>
 }

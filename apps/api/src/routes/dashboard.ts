@@ -2,6 +2,7 @@ import { and, asc, desc, eq, gte, isNull, lt, sql } from 'drizzle-orm'
 import { Hono, type Context } from 'hono'
 import { z } from 'zod'
 import { requireAuth, requireRole, requireTenant } from '../auth/middleware'
+import { hashPassword } from '../auth/password'
 import { createDb } from '../db/client'
 import {
   auditLogs,
@@ -15,6 +16,7 @@ import {
   products,
   tenantSettings,
   tenants,
+  users,
 } from '../db/schema'
 import { newId } from '../lib/id'
 import { scoped } from '../repositories/scoped'
@@ -76,6 +78,52 @@ dashboardRoutes.post('/stores', requireRole('owner'), async (c) => {
 
   return c.json({
     organization: { tenantId, name: parsed.data.name, slug: parsed.data.slug, role: 'owner' },
+  }, 201)
+})
+
+const createDashboardUserSchema = z.object({
+  email: z.string().trim().email().max(320),
+  password: z.string().min(8).max(200),
+  role: z.enum(['admin', 'staff', 'viewer']),
+})
+
+dashboardRoutes.get('/users', requireRole('owner'), async (c) => {
+  const tenantId = c.get('tenant').tenantId
+  const rows = await createDb(c.env)
+    .select({ id: users.id, email: users.email, role: memberships.role })
+    .from(memberships)
+    .innerJoin(users, eq(users.id, memberships.userId))
+    .where(eq(memberships.tenantId, tenantId))
+    .orderBy(asc(users.email))
+  return c.json({ users: rows })
+})
+
+dashboardRoutes.post('/users', requireRole('owner'), async (c) => {
+  const parsed = createDashboardUserSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+
+  const email = parsed.data.email.toLowerCase()
+  const db = createDb(c.env)
+  const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1)
+  if (existing) return c.json({ error: 'email_taken' }, 409)
+
+  const userId = newId('user')
+  const membershipId = newId('mem')
+  const tenantId = c.get('tenant').tenantId
+  const passwordHash = await hashPassword(parsed.data.password)
+  try {
+    await db.batch([
+      db.insert(users).values({ id: userId, email, passwordHash }),
+      db.insert(memberships).values({ id: membershipId, userId, tenantId, role: parsed.data.role }),
+    ])
+  } catch (err) {
+    if (String(err).includes('users_email_unique')) return c.json({ error: 'email_taken' }, 409)
+    throw err
+  }
+
+  return c.json({
+    user: { id: userId, email, role: parsed.data.role },
+    membership: { id: membershipId, tenantId, role: parsed.data.role },
   }, 201)
 })
 

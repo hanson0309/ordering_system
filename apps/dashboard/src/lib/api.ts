@@ -32,6 +32,12 @@ export interface Organization {
   role: 'owner' | 'admin' | 'staff' | 'viewer'
 }
 
+export interface DashboardUser {
+  id: string
+  email: string
+  role: 'owner' | 'admin' | 'staff' | 'viewer'
+}
+
 export interface DashboardSummary {
   period: DashboardAnalyticsPeriod
   orderCount: number
@@ -151,6 +157,17 @@ export function createDashboardStore(input: {
   tagline?: string
 }) {
   return request<{ organization: Organization }>('/dashboard/stores', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function getDashboardUsers() {
+  return request<{ users: DashboardUser[] }>('/dashboard/users')
+}
+
+export function createDashboardUser(input: { email: string; password: string; role: 'admin' | 'staff' | 'viewer' }) {
+  return request<{ user: DashboardUser; membership: { id: string; tenantId: string; role: DashboardUser['role'] } }>('/dashboard/users', {
     method: 'POST',
     body: JSON.stringify(input),
   })
