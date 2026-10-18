@@ -14,6 +14,7 @@ import {
   notificationJobs,
   orderItems,
   orders,
+  productImages,
   products,
   sessions,
   tenantSettings,
@@ -709,6 +710,25 @@ dashboardRoutes.patch('/categories/:categoryId', requireRole('admin'), async (c)
   return c.json({ categoryId, ...parsed.data })
 })
 
+dashboardRoutes.delete('/categories/:categoryId', requireRole('admin'), async (c) => {
+  const tenantId = c.get('tenant').tenantId
+  const branch = await resolveBranch(c)
+  if (branch === false) return c.json({ error: 'not_found' }, 404)
+  const categoryId = c.req.param('categoryId')
+  const db = createDb(c.env)
+  const categoryScope = scoped(categories, tenantId, and(branchPredicate(categories, branch?.id ?? null), eq(categories.id, categoryId)))
+  const [category] = await db.select({ id: categories.id }).from(categories).where(categoryScope).limit(1)
+  if (!category) return c.json({ error: 'not_found' }, 404)
+
+  const productScope = scoped(products, tenantId, and(branchPredicate(products, branch?.id ?? null), eq(products.categoryId, categoryId)))
+  const [, deletedCategory] = await db.batch([
+    db.update(products).set({ categoryId: null }).where(productScope),
+    db.delete(categories).where(categoryScope),
+  ])
+  if (deletedCategory.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  return c.json({ deleted: true })
+})
+
 dashboardRoutes.get('/products', async (c) => {
   const tenantId = c.get('tenant').tenantId
   const branch = await resolveBranch(c)
@@ -794,6 +814,27 @@ dashboardRoutes.patch('/products/:productId', requireRole('admin'), async (c) =>
     .where(scoped(products, tenantId, and(branchPredicate(products, branch?.id ?? null), eq(products.id, productId))))
   if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
   return c.json({ productId, ...parsed.data })
+})
+
+dashboardRoutes.delete('/products/:productId', requireRole('admin'), async (c) => {
+  const tenantId = c.get('tenant').tenantId
+  const branch = await resolveBranch(c)
+  if (branch === false) return c.json({ error: 'not_found' }, 404)
+  const productId = c.req.param('productId')
+  const db = createDb(c.env)
+  const productScope = scoped(products, tenantId, and(branchPredicate(products, branch?.id ?? null), eq(products.id, productId)))
+  const [product] = await db.select({ id: products.id }).from(products).where(productScope).limit(1)
+  if (!product) return c.json({ error: 'not_found' }, 404)
+
+  const imageScope = and(eq(productImages.tenantId, tenantId), eq(productImages.productId, productId))
+  const images = await db.select({ r2Key: productImages.r2Key }).from(productImages).where(imageScope)
+  const [, deletedProduct] = await db.batch([
+    db.delete(productImages).where(imageScope),
+    db.delete(products).where(productScope),
+  ])
+  if (deletedProduct.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  await Promise.all(images.map((image) => c.env.DOCS_BUCKET.delete(image.r2Key)))
+  return c.json({ deleted: true })
 })
 
 dashboardRoutes.get('/settings', async (c) => {

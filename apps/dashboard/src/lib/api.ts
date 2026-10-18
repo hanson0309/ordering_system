@@ -304,6 +304,12 @@ export function createDashboardCategory(input: { name: string; sortOrder?: numbe
   })
 }
 
+export function deleteDashboardCategory(categoryId: string, branchId?: string | null) {
+  return request<{ deleted: true }>(`/dashboard/categories/${categoryId}${branchSuffix(branchId)}`, {
+    method: 'DELETE',
+  })
+}
+
 export function createDashboardProduct(input: {
   name: string
   imageUrl?: string | null
@@ -332,6 +338,12 @@ export function updateDashboardProduct(productId: string, input: Partial<{
   return request<{ productId: string }>(`/dashboard/products/${productId}${branchSuffix(branchId)}`, {
     method: 'PATCH',
     body: JSON.stringify(input),
+  })
+}
+
+export function deleteDashboardProduct(productId: string, branchId?: string | null) {
+  return request<{ deleted: true }>(`/dashboard/products/${productId}${branchSuffix(branchId)}`, {
+    method: 'DELETE',
   })
 }
 

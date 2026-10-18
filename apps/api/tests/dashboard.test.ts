@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
-import { accountTelegramSettings, auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, products, tenantSettings, users } from '../src/db/schema'
+import { accountTelegramSettings, auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, productImages, products, tenantSettings, users } from '../src/db/schema'
 import { newId } from '../src/lib/id'
 import { processDueNotifications } from '../src/services/notifications'
 import { getAnalyticsRange, getMalaysiaDayStart } from '../src/routes/dashboard'
@@ -8,6 +8,7 @@ import type { Env } from '../src/types'
 import {
   SELF,
   addMembership,
+  createCategory,
   createCustomer,
   createProduct,
   createTenant,
@@ -151,6 +152,81 @@ describe('tenant dashboard', () => {
   it('rejects unauthenticated dashboard access', async () => {
     const response = await SELF.fetch('https://test.local/api/dashboard/orders')
     expect(response.status).toBe(401)
+  })
+
+  it('deletes a product and its stored images for the selected organization', async () => {
+    const tenant = await createTenant('Delete Product Store', 'delete-product-store')
+    const user = await createUser('delete-product@example.com')
+    await addMembership(user, tenant, 'owner')
+    const cookie = await loginAndGetCookie('delete-product@example.com')
+    const productId = await createProduct(tenant, { name: 'Remove me' })
+    const imageKey = `tests/${productId}.jpg`
+    await env.DOCS_BUCKET.put(imageKey, 'product image')
+    await db().insert(productImages).values({ id: newId('pimg'), tenantId: tenant, productId, r2Key: imageKey })
+
+    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}`, {
+      method: 'DELETE',
+      headers: { cookie },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ deleted: true })
+    expect(await db().select().from(products).where(eq(products.id, productId))).toEqual([])
+    expect(await db().select().from(productImages).where(eq(productImages.productId, productId))).toEqual([])
+    expect(await env.DOCS_BUCKET.get(imageKey)).toBeNull()
+  })
+
+  it('does not delete another organization product', async () => {
+    const tenant = await createTenant('Product Owner Store', 'product-owner-store')
+    const otherTenant = await createTenant('Other Product Store', 'other-product-store')
+    const user = await createUser('other-delete-product@example.com')
+    await addMembership(user, otherTenant, 'owner')
+    const cookie = await loginAndGetCookie('other-delete-product@example.com')
+    const productId = await createProduct(tenant, { name: 'Keep me' })
+
+    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}`, {
+      method: 'DELETE',
+      headers: { cookie },
+    })
+
+    expect(response.status).toBe(404)
+    expect(await db().select().from(products).where(eq(products.id, productId))).toHaveLength(1)
+  })
+
+  it('deletes a category and keeps its products uncategorized', async () => {
+    const tenant = await createTenant('Delete Category Store', 'delete-category-store')
+    const user = await createUser('delete-category@example.com')
+    await addMembership(user, tenant, 'owner')
+    const cookie = await loginAndGetCookie('delete-category@example.com')
+    const categoryId = await createCategory(tenant, 'Snacks')
+    const productId = await createProduct(tenant, { name: 'Chips', categoryId })
+
+    const response = await SELF.fetch(`https://test.local/api/dashboard/categories/${categoryId}`, {
+      method: 'DELETE',
+      headers: { cookie },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ deleted: true })
+    expect(await db().select().from(categories).where(eq(categories.id, categoryId))).toEqual([])
+    expect(await db().select({ categoryId: products.categoryId }).from(products).where(eq(products.id, productId))).toEqual([{ categoryId: null }])
+  })
+
+  it('does not delete another organization category', async () => {
+    const tenant = await createTenant('Category Owner Store', 'category-owner-store')
+    const otherTenant = await createTenant('Other Category Store', 'other-category-store')
+    const user = await createUser('other-delete-category@example.com')
+    await addMembership(user, otherTenant, 'owner')
+    const cookie = await loginAndGetCookie('other-delete-category@example.com')
+    const categoryId = await createCategory(tenant, 'Keep category')
+
+    const response = await SELF.fetch(`https://test.local/api/dashboard/categories/${categoryId}`, {
+      method: 'DELETE',
+      headers: { cookie },
+    })
+
+    expect(response.status).toBe(404)
+    expect(await db().select().from(categories).where(eq(categories.id, categoryId))).toHaveLength(1)
   })
 
   it('blocks tenant owners from changing the global Telegram configuration', async () => {
