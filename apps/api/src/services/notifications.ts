@@ -1,7 +1,8 @@
 import { and, asc, eq, inArray, isNotNull, or } from 'drizzle-orm'
 import { createDb, type Db } from '../db/client'
-import { branches, customers, notificationJobs, orderItems, orders, tenantSettings, tenants } from '../db/schema'
+import { branches, customers, notificationJobs, orderItems, orders, systemSettings, tenantSettings, tenants } from '../db/schema'
 import { renderOrderListPdf } from './order-pdf'
+import { decryptSecret } from './secret-crypto'
 import type { Env } from '../types'
 
 const MALAYSIA_OFFSET_MS = 8 * 60 * 60 * 1000
@@ -12,14 +13,46 @@ export class TelegramError extends Error {
   }
 }
 
-async function sendDocument(env: Env, input: { pdf: Uint8Array; filename: string }) {
+async function getTelegramCredentials(env: Env, db: Db) {
+  const [saved] = await db.select({ value: systemSettings.value }).from(systemSettings).where(eq(systemSettings.key, 'telegram')).limit(1)
+  if (saved) {
+    if (!env.TELEGRAM_SETTINGS_ENCRYPTION_KEY) throw new TelegramError('telegram_not_configured')
+    try {
+      const config = JSON.parse(await decryptSecret(saved.value, env.TELEGRAM_SETTINGS_ENCRYPTION_KEY)) as { botToken?: string; chatId?: string }
+      if (config.botToken && config.chatId) return { botToken: config.botToken, chatId: config.chatId }
+    } catch {
+      throw new TelegramError('telegram_not_configured')
+    }
+    throw new TelegramError('telegram_not_configured')
+  }
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) throw new TelegramError('telegram_not_configured')
+  return { botToken: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID }
+}
+
+export async function sendTelegramTestMessage(env: Env, db: Db) {
+  const credentials = await getTelegramCredentials(env, db)
+  let response: Response
+  try {
+    response = await fetch(`https://api.telegram.org/bot${credentials.botToken}/sendMessage`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chat_id: credentials.chatId, text: 'Telegram connection test successful.' }),
+    })
+  } catch {
+    throw new TelegramError('telegram_unreachable')
+  }
+  const rawBody = await response.text().catch(() => '')
+  const payload = (() => { try { return JSON.parse(rawBody) as { ok?: boolean } } catch { return null } })()
+  if (!response.ok || payload?.ok === false) throw new TelegramError('telegram_rejected')
+}
+
+async function sendDocument(input: { pdf: Uint8Array; filename: string; botToken: string; chatId: string }) {
   const body = new FormData()
-  body.set('chat_id', env.TELEGRAM_CHAT_ID)
+  body.set('chat_id', input.chatId)
   body.set('document', new File([input.pdf], input.filename, { type: 'application/pdf' }))
   let response: Response
   try {
-    response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendDocument`, { method: 'POST', body })
+    response = await fetch(`https://api.telegram.org/bot${input.botToken}/sendDocument`, { method: 'POST', body })
   } catch {
     throw new TelegramError('telegram_unreachable')
   }
@@ -58,7 +91,8 @@ async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string
   const itemsByOrder = new Map<string, Array<{ productNameSnapshot: string; quantity: number }>>()
   for (const item of items) itemsByOrder.set(item.orderId, [...(itemsByOrder.get(item.orderId) ?? []), item])
   const pdf = await renderOrderListPdf({ organizationName: setting.organizationName, businessDate: parts.date, orders: rows.map((row) => ({ ...row, items: itemsByOrder.get(row.id) ?? [] })) })
-  await sendDocument(env, { pdf, filename: `order-list-${parts.date}.pdf` })
+  const telegram = await getTelegramCredentials(env, db)
+  await sendDocument({ ...telegram, pdf, filename: `order-list-${parts.date}.pdf` })
   const jobsUpdate = db.update(notificationJobs).set({ status: 'sent', lastAttemptAt: new Date(), nextRetryAt: null, errorCategory: null }).where(and(eq(notificationJobs.tenantId, setting.tenantId), inArray(notificationJobs.orderId, orderIds), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled'))))
   if (force) {
     await db.batch([jobsUpdate])

@@ -63,6 +63,22 @@ export const requireTenant = createMiddleware<{ Bindings: Env; Variables: AppVar
     }
 
     const db = createDb(c.env)
+    if (auth.isPlatformAdmin) {
+      const [tenant] = await db
+        .select({ id: tenants.id, status: tenants.status })
+        .from(tenants)
+        .where(eq(tenants.id, auth.activeTenantId))
+        .limit(1)
+
+      if (!tenant || tenant.status !== 'active') {
+        return c.json({ error: 'forbidden' }, 403)
+      }
+
+      c.set('tenant', { tenantId: tenant.id, role: 'owner' })
+      await next()
+      return
+    }
+
     const [membership] = await db
       .select()
       .from(memberships)

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
-import { auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, products, tenantSettings } from '../src/db/schema'
+import { auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, products, systemSettings, tenantSettings, users } from '../src/db/schema'
 import { newId } from '../src/lib/id'
 import { processDueNotifications } from '../src/services/notifications'
 import { getAnalyticsRange, getMalaysiaDayStart } from '../src/routes/dashboard'
@@ -151,6 +151,84 @@ describe('tenant dashboard', () => {
   it('rejects unauthenticated dashboard access', async () => {
     const response = await SELF.fetch('https://test.local/api/dashboard/orders')
     expect(response.status).toBe(401)
+  })
+
+  it('blocks tenant owners from changing the global Telegram configuration', async () => {
+    const tenant = await createTenant('Telegram Store', 'telegram-global-protection')
+    const user = await createUser('telegram-tenant-owner@example.com')
+    await addMembership(user, tenant, 'owner')
+    const cookie = await loginAndGetCookie('telegram-tenant-owner@example.com')
+
+    const response = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', {
+      method: 'PUT',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ botToken: 'secret-token', chatId: '123456' }),
+    })
+
+    expect(response.status).toBe(403)
+  })
+
+  it('lets a platform admin save an encrypted global Telegram configuration without returning the token', async () => {
+    await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
+    const tenant = await createTenant('Telegram Platform Store', 'telegram-platform-settings')
+    const user = await createUser('telegram-platform-admin@example.com')
+    await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user))
+    await addMembership(user, tenant, 'owner')
+    const cookie = await loginAndGetCookie('telegram-platform-admin@example.com')
+    const testEnv = env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }
+    const previousKey = testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY
+    testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY = 'test-only-encryption-key'
+    const telegramEnv = env as unknown as { TELEGRAM_BOT_TOKEN?: string; TELEGRAM_CHAT_ID?: string }
+    const previousToken = telegramEnv.TELEGRAM_BOT_TOKEN
+    const previousChatId = telegramEnv.TELEGRAM_CHAT_ID
+    telegramEnv.TELEGRAM_BOT_TOKEN = 'fallback-token'
+    telegramEnv.TELEGRAM_CHAT_ID = '999999'
+    let fetchSpy: ReturnType<typeof vi.spyOn> | undefined
+
+    try {
+      const save = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', {
+        method: 'PUT',
+        headers: { cookie, 'content-type': 'application/json' },
+        body: JSON.stringify({ botToken: 'sensitive-bot-token', chatId: '-100123456' }),
+      })
+      expect(save.status).toBe(200)
+      expect(await save.json()).toEqual({ configured: true, chatId: '-100123456' })
+
+      const [stored] = await db().select().from(systemSettings).where(eq(systemSettings.key, 'telegram'))
+      expect(stored.value).not.toContain('sensitive-bot-token')
+
+      const read = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', { headers: { cookie } })
+      expect(read.status).toBe(200)
+      expect(await read.json()).toEqual({ configured: true, chatId: '-100123456' })
+
+      const product = await createProduct(tenant)
+      const createdOrder = await postPublicOrder('telegram-platform-settings', {
+        idempotencyKey: 'telegram-shared-config-order',
+        customer: { name: 'Telegram Customer', phone: '0165555555' },
+        items: [{ productId: product, quantity: 1 }],
+      })
+      expect(createdOrder.status).toBe(201)
+      await db().insert(tenantSettings).values({ tenantId: tenant, orderListSendTime: '00:00' })
+
+      fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+      const testMessage = await SELF.fetch('https://test.local/api/dashboard/telegram-settings/test', { method: 'POST', headers: { cookie } })
+      expect(testMessage.status).toBe(200)
+      expect(await testMessage.json()).toEqual({ sent: true })
+      expect(fetchSpy).toHaveBeenCalledWith('https://api.telegram.org/botsensitive-bot-token/sendMessage', expect.objectContaining({ method: 'POST' }))
+      const messageBody = JSON.parse(String((fetchSpy.mock.calls[0]?.[1] as RequestInit).body)) as { chat_id: string; text: string }
+      expect(messageBody).toEqual({ chat_id: '-100123456', text: 'Telegram connection test successful.' })
+      await processDueNotifications(env as unknown as Env, 1000)
+      expect(fetchSpy).toHaveBeenCalledWith('https://api.telegram.org/botsensitive-bot-token/sendDocument', expect.objectContaining({ method: 'POST' }))
+    } finally {
+      fetchSpy?.mockRestore()
+      await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
+      if (previousKey === undefined) delete testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY
+      else testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY = previousKey
+      if (previousToken === undefined) delete telegramEnv.TELEGRAM_BOT_TOKEN
+      else telegramEnv.TELEGRAM_BOT_TOKEN = previousToken
+      if (previousChatId === undefined) delete telegramEnv.TELEGRAM_CHAT_ID
+      else telegramEnv.TELEGRAM_CHAT_ID = previousChatId
+    }
   })
 
   it('lists only the active tenant orders and blocks cross-tenant product mutation', async () => {
@@ -362,6 +440,7 @@ describe('tenant dashboard', () => {
   })
 
   it('sends queued order PDFs to the configured Telegram chat without changing the saved order', async () => {
+    await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
     const tenant = await createTenant('NE', 'dashboard-notify-offline')
     const product = await createProduct(tenant, { priceSen: 800 })
     const response = await postPublicOrder('dashboard-notify-offline', {
@@ -399,6 +478,7 @@ describe('tenant dashboard', () => {
   })
 
   it('lets an admin manually send pending orders without consuming the scheduled digest', async () => {
+    await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
     const tenant = await createTenant('Manual Digest Store', 'manual-digest-store')
     const product = await createProduct(tenant, { priceSen: 1250 })
     const created = await postPublicOrder('manual-digest-store', {

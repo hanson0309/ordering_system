@@ -3,6 +3,7 @@ import {
   SELF,
   createTenant,
   createUser,
+  grantPlatformAdmin,
   addMembership,
   loginAndGetCookie,
   switchOrganization,
@@ -67,6 +68,70 @@ describe('tenant isolation', () => {
     expect(switchToUpm.status).toBe(200)
     const { res: switchToNe } = await switchOrganization(cookie, ne)
     expect(switchToNe.status).toBe(200)
+  })
+
+  it('lets only the platform administrator list and switch to every active account tenant', async () => {
+    const primaryTenant = await createTenant('Primary Account', 'platform-primary')
+    const otherTenant = await createTenant('Other Account', 'platform-other')
+    const adminId = await createUser('platform-admin@example.com')
+    await addMembership(adminId, primaryTenant, 'owner')
+    await grantPlatformAdmin(adminId)
+    const ordinaryId = await createUser('platform-ordinary@example.com')
+    await addMembership(ordinaryId, otherTenant, 'owner')
+
+    const adminCookie = await loginAndGetCookie('platform-admin@example.com')
+    const orgsRes = await SELF.fetch('https://test.local/api/me/organizations', { headers: { cookie: adminCookie } })
+    expect(orgsRes.status).toBe(200)
+    const orgs = await orgsRes.json<{ organizations: { tenantId: string }[] }>()
+    expect(orgs.organizations.map((organization) => organization.tenantId)).toEqual(
+      expect.arrayContaining([primaryTenant, otherTenant]),
+    )
+
+    const { res: switchRes, cookie: selectedCookie } = await switchOrganization(adminCookie, otherTenant)
+    expect(switchRes.status).toBe(200)
+    const settingsRes = await SELF.fetch('https://test.local/api/dashboard/settings', { headers: { cookie: selectedCookie } })
+    expect(settingsRes.status).toBe(200)
+    await expect(settingsRes.json()).resolves.toMatchObject({ tenant: { name: 'Other Account' } })
+
+    const ordinaryCookie = await loginAndGetCookie('platform-ordinary@example.com')
+    const ordinaryOrgsRes = await SELF.fetch('https://test.local/api/me/organizations', { headers: { cookie: ordinaryCookie } })
+    const ordinaryOrgs = await ordinaryOrgsRes.json<{ organizations: { tenantId: string }[] }>()
+    expect(ordinaryOrgs.organizations.map((organization) => organization.tenantId)).toEqual([otherTenant])
+    const { res: forbiddenSwitch } = await switchOrganization(ordinaryCookie, primaryTenant)
+    expect(forbiddenSwitch.status).toBe(403)
+  })
+
+  it('creates each new dashboard account in its own empty tenant', async () => {
+    const primaryTenant = await createTenant('Account Admin', 'account-admin-tenant')
+    const adminId = await createUser('account-admin@example.com')
+    await addMembership(adminId, primaryTenant, 'owner')
+    await grantPlatformAdmin(adminId)
+    const adminCookie = await loginAndGetCookie('account-admin@example.com')
+
+    const firstRes = await SELF.fetch('https://test.local/api/dashboard/users', {
+      method: 'POST',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'first-account@example.com', password: 'password123', role: 'admin' }),
+    })
+    expect(firstRes.status).toBe(201)
+    const first = await firstRes.json<{ membership: { tenantId: string } }>()
+
+    const secondRes = await SELF.fetch('https://test.local/api/dashboard/users', {
+      method: 'POST',
+      headers: { cookie: adminCookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ email: 'second-account@example.com', password: 'password123', role: 'staff' }),
+    })
+    expect(secondRes.status).toBe(201)
+    const second = await secondRes.json<{ membership: { tenantId: string } }>()
+
+    expect(first.membership.tenantId).not.toBe(primaryTenant)
+    expect(second.membership.tenantId).not.toBe(primaryTenant)
+    expect(first.membership.tenantId).not.toBe(second.membership.tenantId)
+
+    const firstCookie = await loginAndGetCookie('first-account@example.com')
+    const firstOrgsRes = await SELF.fetch('https://test.local/api/me/organizations', { headers: { cookie: firstCookie } })
+    const firstOrgs = await firstOrgsRes.json<{ organizations: { tenantId: string }[] }>()
+    expect(firstOrgs.organizations.map((organization) => organization.tenantId)).toEqual([first.membership.tenantId])
   })
 
   it('rejects a tenant switch to an organization the session user never joined', async () => {

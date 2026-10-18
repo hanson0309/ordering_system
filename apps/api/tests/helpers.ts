@@ -1,4 +1,5 @@
 import { env, SELF } from 'cloudflare:test'
+import { eq } from 'drizzle-orm'
 import { createDb } from '../src/db/client'
 import { tenants, users, memberships, customers, orders, categories, products, branches } from '../src/db/schema'
 import { hashPassword } from '../src/auth/password'
@@ -19,6 +20,10 @@ export async function createUser(email: string, password = 'password123') {
   const id = newId('user')
   await db().insert(users).values({ id, email, passwordHash: await hashPassword(password) })
   return id
+}
+
+export async function grantPlatformAdmin(userId: string) {
+  await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, userId))
 }
 
 export async function addMembership(

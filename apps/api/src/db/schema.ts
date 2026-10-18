@@ -89,6 +89,16 @@ export const tenantSettings = sqliteTable('tenant_settings', {
     .default(sql`(unixepoch())`),
 })
 
+// Cross-tenant settings are reserved for platform-level configuration. Secret
+// values are encrypted by the application before they reach this table.
+export const systemSettings = sqliteTable('system_settings', {
+  key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+})
+
 // Server-side sessions. The cookie only ever carries an opaque random token;
 // the DB stores a hash of it plus the currently authorized tenant context.
 // activeTenantId is set only after a membership check (login / org switch)

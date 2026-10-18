@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, gte, isNull, lt, sql } from 'drizzle-orm'
 import { Hono, type Context } from 'hono'
 import { z } from 'zod'
-import { requireAuth, requireRole, requireTenant } from '../auth/middleware'
+import { requireAuth, requirePlatformAdmin, requireRole, requireTenant } from '../auth/middleware'
 import { hashPassword } from '../auth/password'
 import { createDb } from '../db/client'
 import {
@@ -15,6 +15,7 @@ import {
   orders,
   products,
   sessions,
+  systemSettings,
   tenantSettings,
   tenants,
   users,
@@ -22,7 +23,8 @@ import {
 import { newId } from '../lib/id'
 import { scoped } from '../repositories/scoped'
 import { renderOrderPdf } from '../services/order-pdf'
-import { sendOrderListNow, TelegramError } from '../services/notifications'
+import { sendOrderListNow, sendTelegramTestMessage, TelegramError } from '../services/notifications'
+import { decryptSecret, encryptSecret } from '../services/secret-crypto'
 import { uploadErrorResponse, validateUpload } from '../services/uploads'
 import type { AppVariables, Env } from '../types'
 
@@ -93,19 +95,26 @@ const updateDashboardUserSchema = z.object({
   password: z.string().min(8).max(200).optional(),
 }).refine((value) => value.role !== undefined || value.password !== undefined)
 
-dashboardRoutes.get('/users', requireRole('owner'), async (c) => {
-  const tenantId = c.get('tenant').tenantId
+dashboardRoutes.get('/users', requirePlatformAdmin, async (c) => {
   const rows = await createDb(c.env)
-    .select({ id: users.id, email: users.email, role: memberships.role })
+    .select({
+      id: users.id,
+      email: users.email,
+      role: memberships.role,
+      tenantId: tenants.id,
+      tenantName: tenants.name,
+      tenantSlug: tenants.slug,
+    })
     .from(memberships)
     .innerJoin(users, eq(users.id, memberships.userId))
-    .where(eq(memberships.tenantId, tenantId))
-    .orderBy(asc(users.email))
+    .innerJoin(tenants, eq(tenants.id, memberships.tenantId))
+    .where(eq(users.isPlatformAdmin, false))
+    .orderBy(asc(tenants.name), asc(users.email))
   const currentUserId = c.get('auth').userId
   return c.json({ users: rows.map((row) => ({ ...row, isCurrentUser: row.id === currentUserId })) })
 })
 
-dashboardRoutes.post('/users', requireRole('owner'), async (c) => {
+dashboardRoutes.post('/users', requirePlatformAdmin, async (c) => {
   const parsed = createDashboardUserSchema.safeParse(await c.req.json().catch(() => null))
   if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
 
@@ -116,25 +125,31 @@ dashboardRoutes.post('/users', requireRole('owner'), async (c) => {
 
   const userId = newId('user')
   const membershipId = newId('mem')
-  const tenantId = c.get('tenant').tenantId
+  const tenantId = newId('tenant')
+  const tenantSlug = `account-${userId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`
+  const tenantName = email.slice(0, email.indexOf('@')) || 'Account'
   const passwordHash = await hashPassword(parsed.data.password)
   try {
     await db.batch([
       db.insert(users).values({ id: userId, email, passwordHash }),
+      db.insert(tenants).values({ id: tenantId, name: tenantName, slug: tenantSlug, status: 'active' }),
       db.insert(memberships).values({ id: membershipId, userId, tenantId, role: parsed.data.role }),
+      db.insert(tenantSettings).values({ tenantId, businessInfo: { design: 'clean' } }),
     ])
   } catch (err) {
     if (String(err).includes('users_email_unique')) return c.json({ error: 'email_taken' }, 409)
+    if (String(err).includes('tenants_slug_unique')) return c.json({ error: 'slug_taken' }, 409)
     throw err
   }
 
   return c.json({
     user: { id: userId, email, role: parsed.data.role },
     membership: { id: membershipId, tenantId, role: parsed.data.role },
+    organization: { tenantId, name: tenantName, slug: tenantSlug },
   }, 201)
 })
 
-dashboardRoutes.patch('/users/:userId', requireRole('owner'), async (c) => {
+dashboardRoutes.patch('/users/:userId', requirePlatformAdmin, async (c) => {
   const parsed = updateDashboardUserSchema.safeParse(await c.req.json().catch(() => null))
   if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
 
@@ -142,19 +157,18 @@ dashboardRoutes.patch('/users/:userId', requireRole('owner'), async (c) => {
   const userId = c.req.param('userId')
   if (userId === auth.userId) return c.json({ error: 'cannot_edit_self' }, 403)
 
-  const tenantId = c.get('tenant').tenantId
   const db = createDb(c.env)
   const [target] = await db
-    .select({ userId: memberships.userId, email: users.email, role: memberships.role })
+    .select({ userId: memberships.userId, tenantId: memberships.tenantId, email: users.email, role: memberships.role })
     .from(memberships)
     .innerJoin(users, eq(users.id, memberships.userId))
-    .where(and(eq(memberships.tenantId, tenantId), eq(memberships.userId, userId)))
+    .where(and(eq(memberships.userId, userId), eq(users.isPlatformAdmin, false)))
     .limit(1)
   if (!target) return c.json({ error: 'not_found' }, 404)
 
   const statements: any[] = []
   if (parsed.data.role !== undefined) {
-    statements.push(db.update(memberships).set({ role: parsed.data.role }).where(and(eq(memberships.tenantId, tenantId), eq(memberships.userId, userId))))
+    statements.push(db.update(memberships).set({ role: parsed.data.role }).where(and(eq(memberships.tenantId, target.tenantId), eq(memberships.userId, userId))))
   }
   if (parsed.data.password !== undefined) {
     statements.push(db.update(users).set({ passwordHash: await hashPassword(parsed.data.password) }).where(eq(users.id, userId)))
@@ -829,4 +843,61 @@ dashboardRoutes.patch('/settings', requireRole('admin'), async (c) => {
     await db.insert(tenantSettings).values({ tenantId, ...settingsData })
   }
   return c.json({ settings: settingsData, tenant: { name, slug } })
+})
+
+dashboardRoutes.get('/telegram-settings', requirePlatformAdmin, async (c) => {
+  const [setting] = await createDb(c.env)
+    .select({ value: systemSettings.value })
+    .from(systemSettings)
+    .where(eq(systemSettings.key, 'telegram'))
+    .limit(1)
+  if (!setting) return c.json({ configured: false, chatId: '' })
+  const encryptionKey = c.env.TELEGRAM_SETTINGS_ENCRYPTION_KEY
+  if (!encryptionKey) return c.json({ error: 'telegram_encryption_not_configured' }, 503)
+  try {
+    const config = JSON.parse(await decryptSecret(setting.value, encryptionKey)) as { chatId?: string }
+    return c.json({ configured: Boolean(config.chatId), chatId: config.chatId ?? '' })
+  } catch {
+    return c.json({ error: 'telegram_settings_unreadable' }, 503)
+  }
+})
+
+const telegramSettingsSchema = z.object({
+  botToken: z.string().trim().min(1).max(500).optional(),
+  chatId: z.string().trim().min(1).max(200),
+})
+
+dashboardRoutes.put('/telegram-settings', requirePlatformAdmin, async (c) => {
+  const parsed = telegramSettingsSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  const encryptionKey = c.env.TELEGRAM_SETTINGS_ENCRYPTION_KEY
+  if (!encryptionKey) return c.json({ error: 'telegram_encryption_not_configured' }, 503)
+
+  const db = createDb(c.env)
+  const [existing] = await db.select({ value: systemSettings.value }).from(systemSettings).where(eq(systemSettings.key, 'telegram')).limit(1)
+  let botToken = parsed.data.botToken
+  if (!botToken && existing) {
+    try {
+      const current = JSON.parse(await decryptSecret(existing.value, encryptionKey)) as { botToken?: string }
+      botToken = current.botToken
+    } catch {
+      return c.json({ error: 'telegram_settings_unreadable' }, 503)
+    }
+  }
+  if (!botToken) return c.json({ error: 'bot_token_required' }, 400)
+
+  const encrypted = await encryptSecret(JSON.stringify({ botToken, chatId: parsed.data.chatId }), encryptionKey)
+  await db.insert(systemSettings).values({ key: 'telegram', value: encrypted, updatedAt: new Date() })
+    .onConflictDoUpdate({ target: systemSettings.key, set: { value: encrypted, updatedAt: new Date() } })
+  return c.json({ configured: true, chatId: parsed.data.chatId })
+})
+
+dashboardRoutes.post('/telegram-settings/test', requirePlatformAdmin, async (c) => {
+  try {
+    await sendTelegramTestMessage(c.env, createDb(c.env))
+    return c.json({ sent: true })
+  } catch (error) {
+    if (error instanceof TelegramError) return c.json({ error: error.code }, error.code === 'telegram_not_configured' ? 400 : 502)
+    throw error
+  }
 })

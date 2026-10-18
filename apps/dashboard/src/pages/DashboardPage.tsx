@@ -12,6 +12,9 @@ import {
   sendDashboardOrderListNow,
   getDashboardProducts,
   getDashboardSettings,
+  getTelegramSettings,
+  saveTelegramSettings,
+  testTelegramSettings,
   getDashboardUsers,
   createDashboardUser,
   updateDashboardUser,
@@ -60,6 +63,9 @@ export default function DashboardPage() {
   const [branches, setBranches] = useState<DashboardBranch[]>([])
   const [activeBranchId, setActiveBranchId] = useState<string | null>(null)
   const [settings, setSettings] = useState<DashboardSettings | null>(null)
+  const [isPlatformAdmin, setIsPlatformAdmin] = useState(false)
+  const [telegramConfigured, setTelegramConfigured] = useState(false)
+  const [telegramChatId, setTelegramChatId] = useState('')
   const [dashboardUsers, setDashboardUsers] = useState<DashboardUser[]>([])
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState<string | null>(null)
@@ -79,6 +85,7 @@ export default function DashboardPage() {
     try {
       const orgs = await getOrganizations()
       setOrganizations(orgs.organizations)
+      setIsPlatformAdmin(orgs.isPlatformAdmin)
       setActiveTenantId(orgs.activeTenantId)
       if (!orgs.activeTenantId && orgs.organizations[0]) {
         await switchOrganization(orgs.organizations[0].tenantId)
@@ -94,20 +101,22 @@ export default function DashboardPage() {
         ? activeBranchId
         : branchRes.branches.find((branch) => branch.isDefault)?.id ?? branchRes.branches[0]?.id ?? null
       setActiveBranchId(selectedBranchId)
-      const currentOrganization = orgs.organizations.find((organization) => organization.tenantId === (orgs.activeTenantId ?? orgs.organizations[0]?.tenantId))
-      const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes, usersRes] = await Promise.all([
+      const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes, usersRes, telegramRes] = await Promise.all([
         getDashboardSummary(selectedBranchId, analyticsPeriod),
         getDashboardOrders({ limit: 50, branchId: selectedBranchId }),
         getDashboardProducts(selectedBranchId),
         getDashboardCategories(selectedBranchId),
         getDashboardSettings(),
-        currentOrganization?.role === 'owner' ? getDashboardUsers() : Promise.resolve({ users: [] as DashboardUser[] }),
+        orgs.isPlatformAdmin ? getDashboardUsers() : Promise.resolve({ users: [] as DashboardUser[] }),
+        orgs.isPlatformAdmin ? getTelegramSettings() : Promise.resolve({ configured: false, chatId: '' }),
       ])
       setSummary(summaryRes)
       setOrders(ordersRes.orders)
       setProducts(productsRes.products)
       setCategories(categoriesRes.categories)
       setSettings(settingsRes)
+      setTelegramConfigured(telegramRes.configured)
+      setTelegramChatId(telegramRes.chatId)
       setDashboardUsers(usersRes.users)
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
@@ -212,6 +221,7 @@ export default function DashboardPage() {
           <div>
             <p className="text-xs font-semibold uppercase tracking-[0.16em] text-amber-600">Operations</p>
             <h1 className="mt-1 text-xl font-semibold">{activeOrganization.name}</h1>
+            {isPlatformAdmin && <p className="mt-1 text-xs font-medium text-slate-500">{t('Viewing account data for {name}', { name: activeOrganization.name })}</p>}
           </div>
           <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
             <label htmlFor="organization" className="sr-only">{t('Current organization')}</label>
@@ -232,7 +242,7 @@ export default function DashboardPage() {
 
       <div className="mx-auto flex max-w-7xl flex-col gap-6 px-4 py-6 sm:px-6 lg:flex-row">
         <nav aria-label={t('Dashboard navigation')} className="flex gap-2 overflow-x-auto lg:w-44 lg:flex-col">
-          {([['overview', 'Overview'], ['orders', 'Orders'], ['catalog', 'Product catalog'], ['stores', 'Store management'], ['settings', 'Organization settings'], ...(activeOrganization.role === 'owner' ? [['users', 'User management'] as const] : [])] as const).map(([key, label]) => (
+          {([['overview', 'Overview'], ['orders', 'Orders'], ['catalog', 'Product catalog'], ['stores', 'Store management'], ['settings', 'Organization settings'], ...(isPlatformAdmin ? [['users', 'User management'] as const] : [])] as const).map(([key, label]) => (
             <button key={key} type="button" onClick={() => setTab(key)} className={`whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm font-medium ${tab === key ? 'bg-slate-950 text-white' : 'text-slate-600 hover:bg-white'}`}>
               {t(label)}
             </button>
@@ -247,8 +257,8 @@ export default function DashboardPage() {
           {tab === 'orders' && <Orders orders={orders} branchId={activeBranchId} canManage={canManageCatalog} sendingOrderList={sendingOrderList} onSendOrderListNow={handleSendOrderListNow} onRetryNotification={handleRetryNotification} />}
           {tab === 'catalog' && <Catalog products={products} categories={categories} branchId={activeBranchId} canManage={canManageCatalog} onCreated={loadDashboard} />}
           {tab === 'stores' && <Stores organizations={organizations} activeTenantId={activeTenantId} branches={branches} canCreate={activeOrganization.role === 'owner'} canManage={canManageCatalog} onCreated={async (tenantId) => { await handleOrganizationChange(tenantId) }} onBranchesChanged={loadDashboard} />}
-          {tab === 'settings' && <Settings settings={settings} canManage={canManageCatalog} onSaved={loadDashboard} />}
-          {tab === 'users' && activeOrganization.role === 'owner' && <Users users={dashboardUsers} onCreated={async () => { const result = await getDashboardUsers(); setDashboardUsers(result.users) }} />}
+          {tab === 'settings' && <div className="space-y-6"><Settings settings={settings} canManage={canManageCatalog} onSaved={loadDashboard} />{isPlatformAdmin && <TelegramSettings configured={telegramConfigured} savedChatId={telegramChatId} onSaved={loadDashboard} />}</div>}
+          {tab === 'users' && isPlatformAdmin && <Users users={dashboardUsers} onCreated={loadDashboard} />}
         </main>
       </div>
     </div>
@@ -461,6 +471,70 @@ function Settings({ settings, canManage, onSaved }: { settings: DashboardSetting
   </form></section>
 }
 
+function TelegramSettings({ configured, savedChatId, onSaved }: { configured: boolean; savedChatId: string; onSaved: () => Promise<void> }) {
+  const { t } = useLanguage()
+  const [botToken, setBotToken] = useState('')
+  const [chatId, setChatId] = useState(savedChatId)
+  const [saving, setSaving] = useState(false)
+  const [testing, setTesting] = useState(false)
+  const [message, setMessage] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => setChatId(savedChatId), [savedChatId])
+
+  async function save(event: FormEvent) {
+    event.preventDefault()
+    setSaving(true)
+    setMessage(null)
+    setError(null)
+    try {
+      await saveTelegramSettings({ ...(botToken.trim() ? { botToken: botToken.trim() } : {}), chatId: chatId.trim() })
+      setBotToken('')
+      setMessage(t('Telegram settings saved.'))
+      await onSaved()
+    } catch (err) {
+      setError(err instanceof ApiError && err.code === 'telegram_encryption_not_configured'
+        ? t('Telegram encryption is not configured on the API.')
+        : err instanceof ApiError && err.code === 'bot_token_required'
+          ? t('Enter the bot token to configure Telegram for the first time.')
+          : t('Telegram settings could not be saved.'))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function sendTest() {
+    setTesting(true)
+    setMessage(null)
+    setError(null)
+    try {
+      await testTelegramSettings()
+      setMessage(t('Telegram test message sent.'))
+    } catch (err) {
+      setError(err instanceof ApiError && err.code === 'telegram_not_configured'
+        ? t('Save Telegram settings before sending a test.')
+        : err instanceof ApiError && err.code === 'telegram_rejected'
+          ? t('Telegram rejected the test message. Check the bot token and chat ID.')
+          : t('Could not connect to Telegram. Please try again.'))
+    } finally {
+      setTesting(false)
+    }
+  }
+
+  return <section className="max-w-2xl rounded-xl border border-slate-200 bg-white p-5">
+    <h2 className="font-semibold">{t('Telegram API settings')}</h2>
+    <p className="mt-1 text-sm text-slate-500">{t('One Telegram bot is shared by every store. Only the platform administrator can change it.')}</p>
+    <form onSubmit={save} className="mt-5 space-y-4">
+      <div><label htmlFor="telegram-bot-token" className="mb-1.5 block text-sm font-medium">{t('Bot token')}</label><input id="telegram-bot-token" type="password" autoComplete="new-password" value={botToken} onChange={(event) => setBotToken(event.target.value)} placeholder={configured ? t('Saved securely. Leave blank to keep the current token.') : '123456:ABC-DEF...'} className="w-full rounded-lg border border-slate-300 px-3 py-2.5" /><p className="mt-1 text-xs text-slate-400">{t('The token is encrypted before it is stored and is never shown again.')}</p></div>
+      <div><label htmlFor="telegram-chat-id" className="mb-1.5 block text-sm font-medium">{t('Recipient chat ID')}</label><input id="telegram-chat-id" required value={chatId} onChange={(event) => setChatId(event.target.value)} placeholder={t('For example, 123456789 or a group ID')} className="w-full rounded-lg border border-slate-300 px-3 py-2.5" /></div>
+      <p className="rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">{configured ? t('Telegram is configured for all stores.') : t('Telegram is not configured yet.')}</p>
+      {error && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
+      {message && <p role="status" className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{message}</p>}
+      <div className="flex flex-wrap gap-2"><button type="submit" disabled={saving || !chatId.trim()} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{saving ? t('Saving...') : t('Save Telegram settings')}</button>{configured && <button type="button" onClick={() => void sendTest()} disabled={testing} className="rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-medium text-slate-700 disabled:opacity-50">{testing ? t('Sending test...') : t('Send test message')}</button>}</div>
+    </form>
+  </section>
+}
+
 function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => Promise<void> }) {
   const { t } = useLanguage()
   const [email, setEmail] = useState('')
@@ -469,7 +543,7 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [editingRole, setEditingRole] = useState<'admin' | 'staff' | 'viewer'>('staff')
+  const [editingRole, setEditingRole] = useState<DashboardUser['role']>('staff')
   const [editingPassword, setEditingPassword] = useState('')
 
   async function createUser(event: FormEvent) {
@@ -493,7 +567,7 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
 
   function startEditing(user: DashboardUser) {
     setEditingId(user.id)
-    setEditingRole(user.role === 'owner' ? 'staff' : user.role)
+    setEditingRole(user.role)
     setEditingPassword('')
     setError(null)
   }
@@ -502,7 +576,7 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
     setSaving(true)
     setError(null)
     try {
-      await updateDashboardUser(user.id, { ...(user.role === 'owner' ? {} : { role: editingRole }), ...(editingPassword ? { password: editingPassword } : {}) })
+      await updateDashboardUser(user.id, { role: editingRole, ...(editingPassword ? { password: editingPassword } : {}) })
       setEditingId(null)
       setEditingPassword('')
       await onCreated()
@@ -517,7 +591,8 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
   return <div className="space-y-6">
     <section className="max-w-2xl rounded-xl border border-slate-200 bg-white p-5">
       <h2 className="font-semibold">{t('User management')}</h2>
-      <p className="mt-1 text-sm text-slate-500">{t('Only the organization owner can add dashboard accounts.')}</p>
+      <p className="mt-1 text-sm text-slate-500">{t('Only the platform administrator can add dashboard accounts.')}</p>
+      <p className="mt-1 text-sm text-slate-500">{t('Each account starts with its own empty data space.')}</p>
       <form onSubmit={createUser} className="mt-5 space-y-4">
         <label className="block text-sm font-medium">{t('Email')}<input required type="email" value={email} onChange={(event) => setEmail(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2.5 font-normal" /></label>
         <label className="block text-sm font-medium">{t('Password')}<input required minLength={8} type="password" value={password} onChange={(event) => setPassword(event.target.value)} className="mt-2 w-full rounded-lg border border-slate-300 px-3 py-2.5 font-normal" /><span className="mt-1 block text-xs font-normal text-slate-400">{t('At least 8 characters.')}</span></label>
@@ -528,7 +603,7 @@ function Users({ users, onCreated }: { users: DashboardUser[]; onCreated: () => 
     </section>
     <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
       <div className="border-b border-slate-200 px-4 py-4"><h3 className="font-semibold">{t('Organization accounts')}</h3></div>
-      <div className="divide-y divide-slate-100">{users.map((user) => editingId === user.id ? <div key={user.id} className="space-y-3 bg-slate-50 px-4 py-3"><p className="break-all text-sm font-medium">{user.email}</p><div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto_auto]"><select disabled={user.role === 'owner'} value={editingRole} onChange={(event) => setEditingRole(event.target.value as typeof editingRole)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100"><option value="admin">{t('Admin')}</option><option value="staff">{t('Staff')}</option><option value="viewer">{t('Viewer')}</option></select><input type="password" value={editingPassword} onChange={(event) => setEditingPassword(event.target.value)} minLength={8} placeholder={t('Password (leave blank to keep current)')} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" /><button type="button" disabled={saving || (editingPassword.length > 0 && editingPassword.length < 8)} onClick={() => void saveUser(user)} className="rounded-lg bg-slate-950 px-3 py-2 text-sm font-medium text-white disabled:opacity-50">{t('Save changes')}</button><button type="button" disabled={saving} onClick={() => setEditingId(null)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700">{t('Cancel')}</button></div></div> : <div key={user.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div className="min-w-0"><span className="break-all text-sm font-medium">{user.email}</span>{user.isCurrentUser && <span className="ml-2 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">{t('Your account')}</span>}</div><div className="flex items-center gap-2"><span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">{t(user.role === 'owner' ? 'Store owner' : user.role[0].toUpperCase() + user.role.slice(1))}</span>{!user.isCurrentUser && <button type="button" onClick={() => startEditing(user)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">{t('Edit')}</button>}</div></div>)}</div>
+      <div className="divide-y divide-slate-100">{users.map((user) => editingId === user.id ? <div key={user.id} className="space-y-3 bg-slate-50 px-4 py-3"><p className="break-all text-sm font-medium">{user.email}</p><div className="grid gap-3 sm:grid-cols-[1fr_1fr_auto_auto]"><select disabled={user.role === 'owner'} value={editingRole} onChange={(event) => setEditingRole(event.target.value as typeof editingRole)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm disabled:bg-slate-100"><option value="admin">{t('Admin')}</option><option value="staff">{t('Staff')}</option><option value="viewer">{t('Viewer')}</option></select><input type="password" value={editingPassword} onChange={(event) => setEditingPassword(event.target.value)} minLength={8} placeholder={t('Password (leave blank to keep current)')} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" /><button type="button" disabled={saving || (editingPassword.length > 0 && editingPassword.length < 8)} onClick={() => void saveUser(user)} className="rounded-lg bg-slate-950 px-3 py-2 text-sm font-medium text-white disabled:opacity-50">{t('Save changes')}</button><button type="button" disabled={saving} onClick={() => setEditingId(null)} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700">{t('Cancel')}</button></div></div> : <div key={user.id} className="flex flex-wrap items-center justify-between gap-3 px-4 py-3"><div className="min-w-0"><p className="break-all text-sm font-medium">{user.tenantName ?? user.email}</p><p className="break-all text-xs text-slate-500">{user.email}</p>{user.isCurrentUser && <span className="ml-2 rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700">{t('Your account')}</span>}</div><div className="flex items-center gap-2"><span className="shrink-0 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-600">{t(user.role === 'owner' ? 'Store owner' : user.role[0].toUpperCase() + user.role.slice(1))}</span>{!user.isCurrentUser && <button type="button" onClick={() => startEditing(user)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50">{t('Edit')}</button>}</div></div>)}</div>
     </section>
   </div>
 }

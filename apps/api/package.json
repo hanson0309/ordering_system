@@ -10,7 +10,7 @@
     "test": "vitest run",
     "db:generate": "drizzle-kit generate",
     "db:migrate:local": "wrangler d1 migrations apply ordering_system_db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply ordering_system_db --remote"
+    "db:migrate:remote": "wrangler d1 migrations apply ordering_system_db_prod --remote --env production"
   },
   "dependencies": {
     "drizzle-orm": "0.45.4",

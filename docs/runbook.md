@@ -22,7 +22,7 @@ npm run dev:dashboard
 
 The local API uses Wrangler's D1 and R2 emulators. Both frontends proxy `/api` to `http://127.0.0.1:8787`.
 
-To test Telegram delivery locally, create `apps/api/.dev.vars` (this file is git-ignored) with the same two Telegram values described below. The local order-list send button returns a clear configuration error until both values are present.
+To use the Telegram settings page locally, add `TELEGRAM_SETTINGS_ENCRYPTION_KEY` to `apps/api/.dev.vars` (this file is git-ignored). Use a random value of at least 32 bytes. The initial Telegram bot token and chat ID are then entered in Dashboard → Organization settings; they are encrypted before being saved in D1.
 
 The customer ordering link is `http://127.0.0.1:5175/upm`.
 The seller dashboard link is `http://127.0.0.1:5174/dashboard`.
@@ -40,7 +40,7 @@ npm run db:migrate:local
 Apply production migrations only after verifying the target database ID and environment:
 
 ```powershell
-npm run db:migrate:remote
+npm --workspace apps/api run db:migrate:remote
 ```
 
 Never use a client-supplied `tenant_id` for authorization. The active tenant comes from the server-side session and membership check.
@@ -50,11 +50,13 @@ Never use a client-supplied `tenant_id` for authorization. The active tenant com
 Set production secrets with Wrangler. Never commit them, `.dev.vars`, Telegram bot tokens, or R2 credentials:
 
 ```powershell
-wrangler secret put TELEGRAM_BOT_TOKEN --env production
-wrangler secret put TELEGRAM_CHAT_ID --env production
+$key = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+$key | npx wrangler secret put TELEGRAM_SETTINGS_ENCRYPTION_KEY --env production
 ```
 
-`TELEGRAM_BOT_TOKEN` is issued by BotFather. Start a chat with the bot and use the resulting numeric user/chat ID as `TELEGRAM_CHAT_ID`. The Worker calls Telegram's HTTPS `sendDocument` endpoint directly; no VM or private server is required.
+After setting this secret and applying database migrations, the platform administrator can enter the bot token and recipient chat ID in Dashboard → Organization settings. The bot token is encrypted with AES-GCM before it is stored in D1; the encryption key must remain stable or the saved token can no longer be decrypted. Existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` Worker secrets remain supported as a fallback when no dashboard configuration has been saved.
+
+`TELEGRAM_BOT_TOKEN` is issued by BotFather. Start a chat with the bot to get a numeric user/chat ID. The Worker calls Telegram's HTTPS Bot API directly; no VM or private server is required.
 
 ## Notifications
 

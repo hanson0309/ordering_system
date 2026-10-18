@@ -3,7 +3,7 @@ import { setCookie, deleteCookie, getCookie } from 'hono/cookie'
 import { eq, and } from 'drizzle-orm'
 import { z } from 'zod'
 import { createDb } from '../db/client'
-import { users, sessions, memberships } from '../db/schema'
+import { users, sessions, memberships, tenants } from '../db/schema'
 import { verifyPassword } from '../auth/password'
 import { generateSessionToken, hashSessionToken, SESSION_COOKIE_NAME, SESSION_TTL_SECONDS } from '../auth/session'
 import { newId } from '../lib/id'
@@ -108,6 +108,19 @@ authRoutes.post('/switch-organization', requireAuth, async (c) => {
 
   const auth = c.get('auth')
   const db = createDb(c.env)
+  if (auth.isPlatformAdmin) {
+    const [tenant] = await db
+      .select({ id: tenants.id, status: tenants.status })
+      .from(tenants)
+      .where(eq(tenants.id, parsed.data.tenantId))
+      .limit(1)
+    if (!tenant || tenant.status !== 'active') {
+      return c.json({ error: 'forbidden' }, 403)
+    }
+    await createSessionCookie(c, c.env, auth.userId, tenant.id)
+    return c.json({ tenantId: tenant.id, role: 'owner' })
+  }
+
   const [membership] = await db
     .select()
     .from(memberships)

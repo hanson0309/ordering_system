@@ -4,6 +4,7 @@ export interface Env {
   ENVIRONMENT: string
   TELEGRAM_BOT_TOKEN?: string
   TELEGRAM_CHAT_ID?: string
+  TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string
 }
 
 export interface AuthContext {

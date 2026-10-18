@@ -36,6 +36,9 @@ export interface DashboardUser {
   id: string
   email: string
   role: 'owner' | 'admin' | 'staff' | 'viewer'
+  tenantId?: string
+  tenantName?: string
+  tenantSlug?: string
   isCurrentUser?: boolean
 }
 
@@ -148,7 +151,19 @@ export function logout() {
 }
 
 export function getOrganizations() {
-  return request<{ organizations: Organization[]; activeTenantId: string | null }>('/me/organizations')
+  return request<{ organizations: Organization[]; activeTenantId: string | null; isPlatformAdmin: boolean }>('/me/organizations')
+}
+
+export function getTelegramSettings() {
+  return request<{ configured: boolean; chatId: string }>('/dashboard/telegram-settings')
+}
+
+export function saveTelegramSettings(input: { botToken?: string; chatId: string }) {
+  return request<{ configured: boolean; chatId: string }>('/dashboard/telegram-settings', { method: 'PUT', body: JSON.stringify(input) })
+}
+
+export function testTelegramSettings() {
+  return request<{ sent: true }>('/dashboard/telegram-settings/test', { method: 'POST' })
 }
 
 export function createDashboardStore(input: {
@@ -174,7 +189,7 @@ export function createDashboardUser(input: { email: string; password: string; ro
   })
 }
 
-export function updateDashboardUser(userId: string, input: { role?: 'admin' | 'staff' | 'viewer'; password?: string }) {
+export function updateDashboardUser(userId: string, input: { role?: DashboardUser['role']; password?: string }) {
   return request<{ user: DashboardUser; updated: { role: boolean; password: boolean } }>(`/dashboard/users/${encodeURIComponent(userId)}`, {
     method: 'PATCH',
     body: JSON.stringify(input),
