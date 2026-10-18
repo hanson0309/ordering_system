@@ -64,6 +64,13 @@
       "when": 1792320000000,
       "tag": "0010_isolate_dashboard_accounts",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1792323600000,
+      "tag": "0011_account_telegram_settings",
+      "breakpoints": true
     }
   ]
 }

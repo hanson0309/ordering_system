@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, isNotNull, or } from 'drizzle-orm'
 import { createDb, type Db } from '../db/client'
-import { branches, customers, notificationJobs, orderItems, orders, systemSettings, tenantSettings, tenants } from '../db/schema'
+import { accountTelegramSettings, branches, customers, notificationJobs, orderItems, orders, tenantSettings, tenants } from '../db/schema'
 import { renderOrderListPdf } from './order-pdf'
 import { decryptSecret } from './secret-crypto'
 import type { Env } from '../types'
@@ -13,24 +13,21 @@ export class TelegramError extends Error {
   }
 }
 
-async function getTelegramCredentials(env: Env, db: Db) {
-  const [saved] = await db.select({ value: systemSettings.value }).from(systemSettings).where(eq(systemSettings.key, 'telegram')).limit(1)
-  if (saved) {
-    if (!env.TELEGRAM_SETTINGS_ENCRYPTION_KEY) throw new TelegramError('telegram_not_configured')
-    try {
-      const config = JSON.parse(await decryptSecret(saved.value, env.TELEGRAM_SETTINGS_ENCRYPTION_KEY)) as { botToken?: string; chatId?: string }
-      if (config.botToken && config.chatId) return { botToken: config.botToken, chatId: config.chatId }
-    } catch {
-      throw new TelegramError('telegram_not_configured')
-    }
+async function getTelegramCredentials(env: Env, db: Db, accountUserId: string | null) {
+  if (!accountUserId || !env.TELEGRAM_SETTINGS_ENCRYPTION_KEY) throw new TelegramError('telegram_not_configured')
+  const [saved] = await db.select({ value: accountTelegramSettings.value }).from(accountTelegramSettings).where(eq(accountTelegramSettings.accountUserId, accountUserId)).limit(1)
+  if (!saved) throw new TelegramError('telegram_not_configured')
+  try {
+    const config = JSON.parse(await decryptSecret(saved.value, env.TELEGRAM_SETTINGS_ENCRYPTION_KEY)) as { botToken?: string; chatId?: string }
+    if (config.botToken && config.chatId) return { botToken: config.botToken, chatId: config.chatId }
+  } catch {
     throw new TelegramError('telegram_not_configured')
   }
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) throw new TelegramError('telegram_not_configured')
-  return { botToken: env.TELEGRAM_BOT_TOKEN, chatId: env.TELEGRAM_CHAT_ID }
+  throw new TelegramError('telegram_not_configured')
 }
 
-export async function sendTelegramTestMessage(env: Env, db: Db) {
-  const credentials = await getTelegramCredentials(env, db)
+export async function sendTelegramTestMessage(env: Env, db: Db, accountUserId: string) {
+  const credentials = await getTelegramCredentials(env, db, accountUserId)
   let response: Response
   try {
     response = await fetch(`https://api.telegram.org/bot${credentials.botToken}/sendMessage`, {
@@ -78,7 +75,7 @@ function isDue(sendTime: string | null, currentTime: string) {
   return Boolean(sendTime && /^([01]\d|2[0-3]):[0-5]\d$/.test(sendTime) && sendTime <= currentTime)
 }
 
-async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string; organizationName: string; sendTime: string | null; lastSentDate: string | null }, now: Date, force = false) {
+async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string; accountUserId: string | null; organizationName: string; sendTime: string | null; lastSentDate: string | null }, now: Date, force = false) {
   const parts = malaysiaDateParts(now)
   if (!force && (!isDue(setting.sendTime, parts.time) || setting.lastSentDate === parts.date)) return 0
   const rows = await db.select({ id: orders.id, orderNumber: orders.orderNumber, createdAt: orders.createdAt, customerName: customers.name, customerPhone: customers.phone, remark: orders.remark, totalSen: orders.totalSen, branchName: branches.name }).from(orders).innerJoin(customers, and(eq(customers.id, orders.customerId), eq(customers.tenantId, setting.tenantId))).leftJoin(branches, and(eq(branches.id, orders.branchId), eq(branches.tenantId, setting.tenantId))).innerJoin(notificationJobs, and(eq(notificationJobs.orderId, orders.id), eq(notificationJobs.tenantId, setting.tenantId))).where(and(eq(orders.tenantId, setting.tenantId), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled')))).orderBy(asc(orders.createdAt))
@@ -91,7 +88,7 @@ async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string
   const itemsByOrder = new Map<string, Array<{ productNameSnapshot: string; quantity: number }>>()
   for (const item of items) itemsByOrder.set(item.orderId, [...(itemsByOrder.get(item.orderId) ?? []), item])
   const pdf = await renderOrderListPdf({ organizationName: setting.organizationName, businessDate: parts.date, orders: rows.map((row) => ({ ...row, items: itemsByOrder.get(row.id) ?? [] })) })
-  const telegram = await getTelegramCredentials(env, db)
+  const telegram = await getTelegramCredentials(env, db, setting.accountUserId)
   await sendDocument({ ...telegram, pdf, filename: `order-list-${parts.date}.pdf` })
   const jobsUpdate = db.update(notificationJobs).set({ status: 'sent', lastAttemptAt: new Date(), nextRetryAt: null, errorCategory: null }).where(and(eq(notificationJobs.tenantId, setting.tenantId), inArray(notificationJobs.orderId, orderIds), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled'))))
   if (force) {
@@ -108,12 +105,13 @@ async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string
 export async function sendOrderListNow(env: Env, tenantId: string) {
   const db = createDb(env)
   const [[tenant], [settings]] = await Promise.all([
-    db.select({ name: tenants.name }).from(tenants).where(eq(tenants.id, tenantId)).limit(1),
+    db.select({ name: tenants.name, accountUserId: tenants.accountUserId }).from(tenants).where(eq(tenants.id, tenantId)).limit(1),
     db.select({ orderListSendTime: tenantSettings.orderListSendTime, orderListLastSentDate: tenantSettings.orderListLastSentDate }).from(tenantSettings).where(eq(tenantSettings.tenantId, tenantId)).limit(1),
   ])
   if (!tenant) return null
   const orderCount = await sendTenantOrderList(env, db, {
     tenantId,
+    accountUserId: tenant.accountUserId,
     organizationName: tenant.name,
     sendTime: settings?.orderListSendTime ?? null,
     lastSentDate: settings?.orderListLastSentDate ?? null,
@@ -123,8 +121,13 @@ export async function sendOrderListNow(env: Env, tenantId: string) {
 
 export async function processDueNotifications(env: Env, limit = 10) {
   const db = createDb(env)
-  const settings = await db.select({ tenantId: tenantSettings.tenantId, sendTime: tenantSettings.orderListSendTime, lastSentDate: tenantSettings.orderListLastSentDate, organizationName: tenants.name }).from(tenantSettings).innerJoin(tenants, eq(tenants.id, tenantSettings.tenantId)).where(isNotNull(tenantSettings.orderListSendTime)).limit(limit)
+  const settings = await db.select({ tenantId: tenantSettings.tenantId, accountUserId: tenants.accountUserId, sendTime: tenantSettings.orderListSendTime, lastSentDate: tenantSettings.orderListLastSentDate, organizationName: tenants.name }).from(tenantSettings).innerJoin(tenants, eq(tenants.id, tenantSettings.tenantId)).where(isNotNull(tenantSettings.orderListSendTime)).limit(limit)
   for (const setting of settings) {
-    try { await sendTenantOrderList(env, db, { tenantId: setting.tenantId, organizationName: setting.organizationName, sendTime: setting.sendTime, lastSentDate: setting.lastSentDate }, new Date()) } catch (error) { console.error(error) }
+    try { await sendTenantOrderList(env, db, setting, new Date()) } catch (error) {
+      if (error instanceof TelegramError && error.code === 'telegram_not_configured') {
+        await db.update(notificationJobs).set({ errorCategory: error.code }).where(and(eq(notificationJobs.tenantId, setting.tenantId), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled'))))
+      }
+      console.error(error)
+    }
   }
 }

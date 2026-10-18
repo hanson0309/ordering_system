@@ -5,6 +5,7 @@ import { requireAuth, requirePlatformAdmin, requireRole, requireTenant } from '.
 import { hashPassword } from '../auth/password'
 import { createDb } from '../db/client'
 import {
+  accountTelegramSettings,
   auditLogs,
   branches,
   categories,
@@ -15,7 +16,6 @@ import {
   orders,
   products,
   sessions,
-  systemSettings,
   tenantSettings,
   tenants,
   users,
@@ -64,7 +64,7 @@ dashboardRoutes.post('/stores', requireRole('owner'), async (c) => {
   const membershipId = newId('mem')
   try {
     await db.batch([
-      db.insert(tenants).values({ id: tenantId, name: parsed.data.name, slug: parsed.data.slug, status: 'active' }),
+      db.insert(tenants).values({ id: tenantId, accountUserId: auth.userId, name: parsed.data.name, slug: parsed.data.slug, status: 'active' }),
       db.insert(memberships).values({ id: membershipId, userId: auth.userId, tenantId, role: 'owner' }),
       db.insert(tenantSettings).values({
         tenantId,
@@ -132,7 +132,7 @@ dashboardRoutes.post('/users', requirePlatformAdmin, async (c) => {
   try {
     await db.batch([
       db.insert(users).values({ id: userId, email, passwordHash }),
-      db.insert(tenants).values({ id: tenantId, name: tenantName, slug: tenantSlug, status: 'active' }),
+      db.insert(tenants).values({ id: tenantId, accountUserId: userId, name: tenantName, slug: tenantSlug, status: 'active' }),
       db.insert(memberships).values({ id: membershipId, userId, tenantId, role: parsed.data.role }),
       db.insert(tenantSettings).values({ tenantId, businessInfo: { design: 'clean' } }),
     ])
@@ -845,11 +845,33 @@ dashboardRoutes.patch('/settings', requireRole('admin'), async (c) => {
   return c.json({ settings: settingsData, tenant: { name, slug } })
 })
 
+dashboardRoutes.get('/telegram-accounts', requirePlatformAdmin, async (c) => {
+  const rows = await createDb(c.env)
+    .select({ id: users.id, email: users.email, configured: accountTelegramSettings.accountUserId })
+    .from(users)
+    .leftJoin(accountTelegramSettings, eq(accountTelegramSettings.accountUserId, users.id))
+    .where(eq(users.isPlatformAdmin, false))
+    .orderBy(asc(users.email))
+  return c.json({ accounts: rows.map((row) => ({ id: row.id, email: row.email, configured: Boolean(row.configured) })) })
+})
+
+async function resolveTelegramAccount(c: DashboardContext, accountUserId: string | undefined) {
+  if (!accountUserId) return null
+  const [account] = await createDb(c.env)
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.id, accountUserId), eq(users.isPlatformAdmin, false)))
+    .limit(1)
+  return account ?? null
+}
+
 dashboardRoutes.get('/telegram-settings', requirePlatformAdmin, async (c) => {
+  const accountUserId = c.req.query('accountUserId')
+  if (!(await resolveTelegramAccount(c, accountUserId))) return c.json({ error: 'account_not_found' }, 404)
   const [setting] = await createDb(c.env)
-    .select({ value: systemSettings.value })
-    .from(systemSettings)
-    .where(eq(systemSettings.key, 'telegram'))
+    .select({ value: accountTelegramSettings.value })
+    .from(accountTelegramSettings)
+    .where(eq(accountTelegramSettings.accountUserId, accountUserId!))
     .limit(1)
   if (!setting) return c.json({ configured: false, chatId: '' })
   const encryptionKey = c.env.TELEGRAM_SETTINGS_ENCRYPTION_KEY
@@ -863,6 +885,7 @@ dashboardRoutes.get('/telegram-settings', requirePlatformAdmin, async (c) => {
 })
 
 const telegramSettingsSchema = z.object({
+  accountUserId: z.string().min(1),
   botToken: z.string().trim().min(1).max(500).optional(),
   chatId: z.string().trim().min(1).max(200),
 })
@@ -870,11 +893,12 @@ const telegramSettingsSchema = z.object({
 dashboardRoutes.put('/telegram-settings', requirePlatformAdmin, async (c) => {
   const parsed = telegramSettingsSchema.safeParse(await c.req.json().catch(() => null))
   if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  if (!(await resolveTelegramAccount(c, parsed.data.accountUserId))) return c.json({ error: 'account_not_found' }, 404)
   const encryptionKey = c.env.TELEGRAM_SETTINGS_ENCRYPTION_KEY
   if (!encryptionKey) return c.json({ error: 'telegram_encryption_not_configured' }, 503)
 
   const db = createDb(c.env)
-  const [existing] = await db.select({ value: systemSettings.value }).from(systemSettings).where(eq(systemSettings.key, 'telegram')).limit(1)
+  const [existing] = await db.select({ value: accountTelegramSettings.value }).from(accountTelegramSettings).where(eq(accountTelegramSettings.accountUserId, parsed.data.accountUserId)).limit(1)
   let botToken = parsed.data.botToken
   if (!botToken && existing) {
     try {
@@ -887,14 +911,17 @@ dashboardRoutes.put('/telegram-settings', requirePlatformAdmin, async (c) => {
   if (!botToken) return c.json({ error: 'bot_token_required' }, 400)
 
   const encrypted = await encryptSecret(JSON.stringify({ botToken, chatId: parsed.data.chatId }), encryptionKey)
-  await db.insert(systemSettings).values({ key: 'telegram', value: encrypted, updatedAt: new Date() })
-    .onConflictDoUpdate({ target: systemSettings.key, set: { value: encrypted, updatedAt: new Date() } })
+  await db.insert(accountTelegramSettings).values({ accountUserId: parsed.data.accountUserId, value: encrypted, updatedAt: new Date() })
+    .onConflictDoUpdate({ target: accountTelegramSettings.accountUserId, set: { value: encrypted, updatedAt: new Date() } })
   return c.json({ configured: true, chatId: parsed.data.chatId })
 })
 
 dashboardRoutes.post('/telegram-settings/test', requirePlatformAdmin, async (c) => {
+  const parsed = z.object({ accountUserId: z.string().min(1) }).safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  if (!(await resolveTelegramAccount(c, parsed.data.accountUserId))) return c.json({ error: 'account_not_found' }, 404)
   try {
-    await sendTelegramTestMessage(c.env, createDb(c.env))
+    await sendTelegramTestMessage(c.env, createDb(c.env), parsed.data.accountUserId)
     return c.json({ sent: true })
   } catch (error) {
     if (error instanceof TelegramError) return c.json({ error: error.code }, error.code === 'telegram_not_configured' ? 400 : 502)

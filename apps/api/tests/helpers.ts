@@ -10,9 +10,9 @@ export function db() {
   return createDb(env as unknown as Env)
 }
 
-export async function createTenant(name: string, slug: string) {
+export async function createTenant(name: string, slug: string, accountUserId?: string) {
   const id = newId('tenant')
-  await db().insert(tenants).values({ id, name, slug })
+  await db().insert(tenants).values({ id, accountUserId: accountUserId ?? null, name, slug })
   return id
 }
 

@@ -12,6 +12,7 @@ import {
   sendDashboardOrderListNow,
   getDashboardProducts,
   getDashboardSettings,
+  getTelegramAccounts,
   getTelegramSettings,
   saveTelegramSettings,
   testTelegramSettings,
@@ -64,8 +65,6 @@ export default function DashboardPage() {
   const [activeBranchId, setActiveBranchId] = useState<string | null>(null)
   const [settings, setSettings] = useState<DashboardSettings | null>(null)
   const [isPlatformAdmin, setIsPlatformAdmin] = useState(false)
-  const [telegramConfigured, setTelegramConfigured] = useState(false)
-  const [telegramChatId, setTelegramChatId] = useState('')
   const [dashboardUsers, setDashboardUsers] = useState<DashboardUser[]>([])
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState<string | null>(null)
@@ -101,22 +100,19 @@ export default function DashboardPage() {
         ? activeBranchId
         : branchRes.branches.find((branch) => branch.isDefault)?.id ?? branchRes.branches[0]?.id ?? null
       setActiveBranchId(selectedBranchId)
-      const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes, usersRes, telegramRes] = await Promise.all([
+      const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes, usersRes] = await Promise.all([
         getDashboardSummary(selectedBranchId, analyticsPeriod),
         getDashboardOrders({ limit: 50, branchId: selectedBranchId }),
         getDashboardProducts(selectedBranchId),
         getDashboardCategories(selectedBranchId),
         getDashboardSettings(),
         orgs.isPlatformAdmin ? getDashboardUsers() : Promise.resolve({ users: [] as DashboardUser[] }),
-        orgs.isPlatformAdmin ? getTelegramSettings() : Promise.resolve({ configured: false, chatId: '' }),
       ])
       setSummary(summaryRes)
       setOrders(ordersRes.orders)
       setProducts(productsRes.products)
       setCategories(categoriesRes.categories)
       setSettings(settingsRes)
-      setTelegramConfigured(telegramRes.configured)
-      setTelegramChatId(telegramRes.chatId)
       setDashboardUsers(usersRes.users)
     } catch (err) {
       if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
@@ -200,8 +196,8 @@ export default function DashboardPage() {
       await loadDashboard()
     } catch (err) {
       if (err instanceof ApiError && err.code === 'no_pending_orders') setError(t('There are no new orders to summarize.'))
-      else if (err instanceof ApiError && err.code === 'telegram_not_configured') setError(t('Telegram is not configured. Add the bot token and recipient chat ID to the API environment.'))
-      else if (err instanceof ApiError && err.code === 'telegram_rejected') setError(t('Telegram rejected the order list. Check the bot token and recipient chat ID.'))
+      else if (err instanceof ApiError && err.code === 'telegram_not_configured') setError(t('Telegram is not configured for this account. Ask the platform administrator to add its bot token and chat ID.'))
+      else if (err instanceof ApiError && err.code === 'telegram_rejected') setError(t('Telegram rejected the order list. Check this account’s bot token and chat ID.'))
       else if (err instanceof ApiError && err.code === 'telegram_unreachable') setError(t('Could not connect to Telegram. Please try again.'))
       else setError(t('Order list could not be sent.'))
     } finally {
@@ -257,7 +253,7 @@ export default function DashboardPage() {
           {tab === 'orders' && <Orders orders={orders} branchId={activeBranchId} canManage={canManageCatalog} sendingOrderList={sendingOrderList} onSendOrderListNow={handleSendOrderListNow} onRetryNotification={handleRetryNotification} />}
           {tab === 'catalog' && <Catalog products={products} categories={categories} branchId={activeBranchId} canManage={canManageCatalog} onCreated={loadDashboard} />}
           {tab === 'stores' && <Stores organizations={organizations} activeTenantId={activeTenantId} branches={branches} canCreate={activeOrganization.role === 'owner'} canManage={canManageCatalog} onCreated={async (tenantId) => { await handleOrganizationChange(tenantId) }} onBranchesChanged={loadDashboard} />}
-          {tab === 'settings' && <div className="space-y-6"><Settings settings={settings} canManage={canManageCatalog} onSaved={loadDashboard} />{isPlatformAdmin && <TelegramSettings configured={telegramConfigured} savedChatId={telegramChatId} onSaved={loadDashboard} />}</div>}
+          {tab === 'settings' && <div className="space-y-6"><Settings settings={settings} canManage={canManageCatalog} onSaved={loadDashboard} />{isPlatformAdmin && <TelegramSettings />}</div>}
           {tab === 'users' && isPlatformAdmin && <Users users={dashboardUsers} onCreated={loadDashboard} />}
         </main>
       </div>
@@ -471,16 +467,52 @@ function Settings({ settings, canManage, onSaved }: { settings: DashboardSetting
   </form></section>
 }
 
-function TelegramSettings({ configured, savedChatId, onSaved }: { configured: boolean; savedChatId: string; onSaved: () => Promise<void> }) {
+function TelegramSettings() {
   const { t } = useLanguage()
+  const [accounts, setAccounts] = useState<{ id: string; email: string; configured: boolean }[]>([])
+  const [accountUserId, setAccountUserId] = useState('')
+  const [configured, setConfigured] = useState(false)
   const [botToken, setBotToken] = useState('')
-  const [chatId, setChatId] = useState(savedChatId)
+  const [chatId, setChatId] = useState('')
   const [saving, setSaving] = useState(false)
   const [testing, setTesting] = useState(false)
+  const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
 
-  useEffect(() => setChatId(savedChatId), [savedChatId])
+  async function loadAccounts() {
+    setLoading(true)
+    try {
+      const result = await getTelegramAccounts()
+      setAccounts(result.accounts)
+      if (!accountUserId && result.accounts[0]) setAccountUserId(result.accounts[0].id)
+    } catch {
+      setError(t('Telegram accounts could not be loaded.'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => { void loadAccounts() }, [])
+
+  useEffect(() => {
+    if (!accountUserId) return
+    let active = true
+    setConfigured(false)
+    setChatId('')
+    setBotToken('')
+    setMessage(null)
+    setError(null)
+    void getTelegramSettings(accountUserId).then((result) => {
+      if (!active) return
+      setConfigured(result.configured)
+      setChatId(result.chatId)
+      setAccounts((current) => current.map((account) => account.id === accountUserId ? { ...account, configured: result.configured } : account))
+    }).catch(() => {
+      if (active) setError(t('Telegram settings could not be loaded.'))
+    })
+    return () => { active = false }
+  }, [accountUserId])
 
   async function save(event: FormEvent) {
     event.preventDefault()
@@ -488,10 +520,11 @@ function TelegramSettings({ configured, savedChatId, onSaved }: { configured: bo
     setMessage(null)
     setError(null)
     try {
-      await saveTelegramSettings({ ...(botToken.trim() ? { botToken: botToken.trim() } : {}), chatId: chatId.trim() })
+      await saveTelegramSettings({ accountUserId, ...(botToken.trim() ? { botToken: botToken.trim() } : {}), chatId: chatId.trim() })
       setBotToken('')
+      setConfigured(true)
       setMessage(t('Telegram settings saved.'))
-      await onSaved()
+      await loadAccounts()
     } catch (err) {
       setError(err instanceof ApiError && err.code === 'telegram_encryption_not_configured'
         ? t('Telegram encryption is not configured on the API.')
@@ -508,7 +541,7 @@ function TelegramSettings({ configured, savedChatId, onSaved }: { configured: bo
     setMessage(null)
     setError(null)
     try {
-      await testTelegramSettings()
+      await testTelegramSettings(accountUserId)
       setMessage(t('Telegram test message sent.'))
     } catch (err) {
       setError(err instanceof ApiError && err.code === 'telegram_not_configured'
@@ -523,15 +556,17 @@ function TelegramSettings({ configured, savedChatId, onSaved }: { configured: bo
 
   return <section className="max-w-2xl rounded-xl border border-slate-200 bg-white p-5">
     <h2 className="font-semibold">{t('Telegram API settings')}</h2>
-    <p className="mt-1 text-sm text-slate-500">{t('One Telegram bot is shared by every store. Only the platform administrator can change it.')}</p>
-    <form onSubmit={save} className="mt-5 space-y-4">
+    <p className="mt-1 text-sm text-slate-500">{t('Each dashboard account has its own Telegram bot and recipient. Only the platform administrator can change them.')}</p>
+    {loading ? <p className="mt-5 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">{t('Loading Telegram accounts...')}</p> : accounts.length === 0 ? <p className="mt-5 rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">{t('No dashboard accounts available.')}</p> : <form onSubmit={save} className="mt-5 space-y-4">
+      <div><label htmlFor="telegram-account" className="mb-1.5 block text-sm font-medium">{t('Dashboard account')}</label><select id="telegram-account" value={accountUserId} onChange={(event) => setAccountUserId(event.target.value)} className="w-full rounded-lg border border-slate-300 px-3 py-2.5">{accounts.map((account) => <option key={account.id} value={account.id}>{account.email}</option>)}</select></div>
       <div><label htmlFor="telegram-bot-token" className="mb-1.5 block text-sm font-medium">{t('Bot token')}</label><input id="telegram-bot-token" type="password" autoComplete="new-password" value={botToken} onChange={(event) => setBotToken(event.target.value)} placeholder={configured ? t('Saved securely. Leave blank to keep the current token.') : '123456:ABC-DEF...'} className="w-full rounded-lg border border-slate-300 px-3 py-2.5" /><p className="mt-1 text-xs text-slate-400">{t('The token is encrypted before it is stored and is never shown again.')}</p></div>
       <div><label htmlFor="telegram-chat-id" className="mb-1.5 block text-sm font-medium">{t('Recipient chat ID')}</label><input id="telegram-chat-id" required value={chatId} onChange={(event) => setChatId(event.target.value)} placeholder={t('For example, 123456789 or a group ID')} className="w-full rounded-lg border border-slate-300 px-3 py-2.5" /></div>
-      <p className="rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">{configured ? t('Telegram is configured for all stores.') : t('Telegram is not configured yet.')}</p>
+      <p className="rounded-lg bg-slate-50 px-3 py-2 text-sm text-slate-600">{configured ? t('Telegram is configured for this dashboard account and its stores.') : t('Telegram is not configured yet for this account.')}</p>
       {error && <p role="alert" className="rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
       {message && <p role="status" className="rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-700">{message}</p>}
       <div className="flex flex-wrap gap-2"><button type="submit" disabled={saving || !chatId.trim()} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{saving ? t('Saving...') : t('Save Telegram settings')}</button>{configured && <button type="button" onClick={() => void sendTest()} disabled={testing} className="rounded-lg border border-slate-300 px-4 py-2.5 text-sm font-medium text-slate-700 disabled:opacity-50">{testing ? t('Sending test...') : t('Send test message')}</button>}</div>
     </form>
+    }
   </section>
 }
 

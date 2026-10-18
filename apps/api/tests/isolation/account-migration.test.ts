@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { D1Migration } from '@cloudflare/vitest-plugin'
 import { eq } from 'drizzle-orm'
-import { customers, memberships, sessions, tenants } from '../../src/db/schema'
+import { customers, memberships, sessions, systemSettings, tenants } from '../../src/db/schema'
 import { newId } from '../../src/lib/id'
 import { createUser, db, env } from '../helpers'
 
@@ -50,5 +50,31 @@ describe('account isolation migration', () => {
     for (const query of migration!.queries) await env.DB.prepare(query).run()
     expect(await db().select().from(memberships).where(eq(memberships.userId, firstUserId))).toHaveLength(1)
     expect(await db().select().from(memberships).where(eq(memberships.userId, secondUserId))).toHaveLength(1)
+  })
+
+  it('backfills an unambiguous tenant owner and removes only the legacy Telegram system setting', async () => {
+    const owner = await createUser('migration-telegram-owner@example.com')
+    const tenantId = 'migration-telegram-owner-tenant'
+    await db().insert(tenants).values({ id: tenantId, name: 'Owned tenant', slug: 'migration-telegram-owned' })
+    await db().insert(memberships).values({ id: newId('mem'), userId: owner, tenantId, role: 'owner' })
+    await db().insert(systemSettings).values([
+      { key: 'telegram', value: 'legacy encrypted value' },
+      { key: 'unrelated', value: 'keep me' },
+    ])
+
+    const migrations = (env as unknown as { TEST_MIGRATIONS: D1Migration[] }).TEST_MIGRATIONS
+    const migration = migrations.find(({ name }) => name.includes('0011_account_telegram_settings'))
+    expect(migration).toBeDefined()
+    const ownerBackfill = migration!.queries.find((query) => query.includes("`m`.`role` = 'owner'") && query.includes('UPDATE `tenants`'))
+    const legacyCleanup = migration!.queries.find((query) => query.includes("DELETE FROM `system_settings` WHERE `key` = 'telegram'"))
+    expect(ownerBackfill).toBeDefined()
+    expect(legacyCleanup).toBeDefined()
+    await env.DB.prepare(ownerBackfill!).run()
+    await env.DB.prepare(legacyCleanup!).run()
+
+    const [savedTenant] = await db().select().from(tenants).where(eq(tenants.id, tenantId))
+    expect(savedTenant.accountUserId).toBe(owner)
+    const remainingSettings = await db().select().from(systemSettings)
+    expect(remainingSettings).toMatchObject([{ key: 'unrelated', value: 'keep me' }])
   })
 })

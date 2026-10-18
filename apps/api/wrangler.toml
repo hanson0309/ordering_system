@@ -46,6 +46,5 @@ ENVIRONMENT = "production"
 crons = ["*/5 * * * *"]
 
 # Secrets (set via `wrangler secret put <NAME>` — never committed):
-#   SESSION_SIGNING_SECRET   - signs/verifies session cookies
-#   TELEGRAM_BOT_TOKEN       - Bot token issued by BotFather
-#   TELEGRAM_CHAT_ID         - single Telegram user/chat that receives order PDFs
+#   SESSION_SIGNING_SECRET            - signs/verifies session cookies
+#   TELEGRAM_SETTINGS_ENCRYPTION_KEY  - encrypts per-account Telegram bot tokens

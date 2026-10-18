@@ -2,8 +2,6 @@ export interface Env {
   DB: D1Database
   DOCS_BUCKET: R2Bucket
   ENVIRONMENT: string
-  TELEGRAM_BOT_TOKEN?: string
-  TELEGRAM_CHAT_ID?: string
   TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string
 }
 

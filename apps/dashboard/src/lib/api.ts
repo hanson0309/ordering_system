@@ -154,16 +154,26 @@ export function getOrganizations() {
   return request<{ organizations: Organization[]; activeTenantId: string | null; isPlatformAdmin: boolean }>('/me/organizations')
 }
 
-export function getTelegramSettings() {
-  return request<{ configured: boolean; chatId: string }>('/dashboard/telegram-settings')
+export interface TelegramAccount {
+  id: string
+  email: string
+  configured: boolean
 }
 
-export function saveTelegramSettings(input: { botToken?: string; chatId: string }) {
+export function getTelegramAccounts() {
+  return request<{ accounts: TelegramAccount[] }>('/dashboard/telegram-accounts')
+}
+
+export function getTelegramSettings(accountUserId: string) {
+  return request<{ configured: boolean; chatId: string }>(`/dashboard/telegram-settings?accountUserId=${encodeURIComponent(accountUserId)}`)
+}
+
+export function saveTelegramSettings(input: { accountUserId: string; botToken?: string; chatId: string }) {
   return request<{ configured: boolean; chatId: string }>('/dashboard/telegram-settings', { method: 'PUT', body: JSON.stringify(input) })
 }
 
-export function testTelegramSettings() {
-  return request<{ sent: true }>('/dashboard/telegram-settings/test', { method: 'POST' })
+export function testTelegramSettings(accountUserId: string) {
+  return request<{ sent: true }>('/dashboard/telegram-settings/test', { method: 'POST', body: JSON.stringify({ accountUserId }) })
 }
 
 export function createDashboardStore(input: {

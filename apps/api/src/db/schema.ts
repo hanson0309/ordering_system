@@ -13,6 +13,7 @@ import {
 
 export const tenants = sqliteTable('tenants', {
   id: text('id').primaryKey(),
+  accountUserId: text('account_user_id').references(() => users.id),
   slug: text('slug').notNull(),
   name: text('name').notNull(),
   status: text('status', { enum: ['active', 'suspended'] })
@@ -93,6 +94,14 @@ export const tenantSettings = sqliteTable('tenant_settings', {
 // values are encrypted by the application before they reach this table.
 export const systemSettings = sqliteTable('system_settings', {
   key: text('key').primaryKey(),
+  value: text('value').notNull(),
+  updatedAt: integer('updated_at', { mode: 'timestamp' })
+    .notNull()
+    .default(sql`(unixepoch())`),
+})
+
+export const accountTelegramSettings = sqliteTable('account_telegram_settings', {
+  accountUserId: text('account_user_id').primaryKey().references(() => users.id),
   value: text('value').notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' })
     .notNull()

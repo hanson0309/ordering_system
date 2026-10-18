@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
-import { auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, products, systemSettings, tenantSettings, users } from '../src/db/schema'
+import { accountTelegramSettings, auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, products, tenantSettings, users } from '../src/db/schema'
 import { newId } from '../src/lib/id'
 import { processDueNotifications } from '../src/services/notifications'
 import { getAnalyticsRange, getMalaysiaDayStart } from '../src/routes/dashboard'
@@ -168,36 +168,32 @@ describe('tenant dashboard', () => {
     expect(response.status).toBe(403)
   })
 
-  it('lets a platform admin save an encrypted global Telegram configuration without returning the token', async () => {
-    await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
-    const tenant = await createTenant('Telegram Platform Store', 'telegram-platform-settings')
-    const user = await createUser('telegram-platform-admin@example.com')
-    await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, user))
-    await addMembership(user, tenant, 'owner')
+  it('lets a platform admin save an account-specific encrypted Telegram configuration without returning the token', async () => {
+    const user = await createUser('telegram-configured-account@example.com')
+    const tenant = await createTenant('Telegram Platform Store', 'telegram-platform-settings', user)
+    const platformUser = await createUser('telegram-platform-admin@example.com')
+    await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, platformUser))
+    const platformTenant = await createTenant('Platform Admin Store', 'telegram-platform-admin-store')
+    await addMembership(platformUser, platformTenant, 'owner')
     const cookie = await loginAndGetCookie('telegram-platform-admin@example.com')
     const testEnv = env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }
     const previousKey = testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY
     testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY = 'test-only-encryption-key'
-    const telegramEnv = env as unknown as { TELEGRAM_BOT_TOKEN?: string; TELEGRAM_CHAT_ID?: string }
-    const previousToken = telegramEnv.TELEGRAM_BOT_TOKEN
-    const previousChatId = telegramEnv.TELEGRAM_CHAT_ID
-    telegramEnv.TELEGRAM_BOT_TOKEN = 'fallback-token'
-    telegramEnv.TELEGRAM_CHAT_ID = '999999'
     let fetchSpy: ReturnType<typeof vi.spyOn> | undefined
 
     try {
       const save = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', {
         method: 'PUT',
         headers: { cookie, 'content-type': 'application/json' },
-        body: JSON.stringify({ botToken: 'sensitive-bot-token', chatId: '-100123456' }),
+        body: JSON.stringify({ accountUserId: user, botToken: 'sensitive-bot-token', chatId: '-100123456' }),
       })
       expect(save.status).toBe(200)
       expect(await save.json()).toEqual({ configured: true, chatId: '-100123456' })
 
-      const [stored] = await db().select().from(systemSettings).where(eq(systemSettings.key, 'telegram'))
+      const [stored] = await db().select().from(accountTelegramSettings).where(eq(accountTelegramSettings.accountUserId, user))
       expect(stored.value).not.toContain('sensitive-bot-token')
 
-      const read = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', { headers: { cookie } })
+      const read = await SELF.fetch(`https://test.local/api/dashboard/telegram-settings?accountUserId=${user}`, { headers: { cookie } })
       expect(read.status).toBe(200)
       expect(await read.json()).toEqual({ configured: true, chatId: '-100123456' })
 
@@ -211,7 +207,7 @@ describe('tenant dashboard', () => {
       await db().insert(tenantSettings).values({ tenantId: tenant, orderListSendTime: '00:00' })
 
       fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }))
-      const testMessage = await SELF.fetch('https://test.local/api/dashboard/telegram-settings/test', { method: 'POST', headers: { cookie } })
+      const testMessage = await SELF.fetch('https://test.local/api/dashboard/telegram-settings/test', { method: 'POST', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ accountUserId: user }) })
       expect(testMessage.status).toBe(200)
       expect(await testMessage.json()).toEqual({ sent: true })
       expect(fetchSpy).toHaveBeenCalledWith('https://api.telegram.org/botsensitive-bot-token/sendMessage', expect.objectContaining({ method: 'POST' }))
@@ -221,13 +217,49 @@ describe('tenant dashboard', () => {
       expect(fetchSpy).toHaveBeenCalledWith('https://api.telegram.org/botsensitive-bot-token/sendDocument', expect.objectContaining({ method: 'POST' }))
     } finally {
       fetchSpy?.mockRestore()
-      await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
       if (previousKey === undefined) delete testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY
       else testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY = previousKey
-      if (previousToken === undefined) delete telegramEnv.TELEGRAM_BOT_TOKEN
-      else telegramEnv.TELEGRAM_BOT_TOKEN = previousToken
-      if (previousChatId === undefined) delete telegramEnv.TELEGRAM_CHAT_ID
-      else telegramEnv.TELEGRAM_CHAT_ID = previousChatId
+    }
+  })
+
+  it('keeps Telegram settings isolated between dashboard accounts', async () => {
+    const firstAccount = await createUser('telegram-isolation-first@example.com')
+    const secondAccount = await createUser('telegram-isolation-second@example.com')
+    const platformUser = await createUser('telegram-isolation-platform@example.com')
+    await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, platformUser))
+    const platformTenant = await createTenant('Telegram Isolation Platform Store', 'telegram-isolation-platform')
+    await addMembership(platformUser, platformTenant, 'owner')
+    const cookie = await loginAndGetCookie('telegram-isolation-platform@example.com')
+    const testEnv = env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }
+    const previousKey = testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY
+    testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY = 'test-only-encryption-key'
+
+    try {
+      for (const [accountUserId, botToken, chatId] of [
+        [firstAccount, 'first-account-token', 'first-chat'],
+        [secondAccount, 'second-account-token', 'second-chat'],
+      ]) {
+        const response = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', {
+          method: 'PUT',
+          headers: { cookie, 'content-type': 'application/json' },
+          body: JSON.stringify({ accountUserId, botToken, chatId }),
+        })
+        expect(response.status).toBe(200)
+      }
+
+      const firstRead = await SELF.fetch(`https://test.local/api/dashboard/telegram-settings?accountUserId=${firstAccount}`, { headers: { cookie } })
+      const secondRead = await SELF.fetch(`https://test.local/api/dashboard/telegram-settings?accountUserId=${secondAccount}`, { headers: { cookie } })
+      await expect(firstRead.json()).resolves.toEqual({ configured: true, chatId: 'first-chat' })
+      await expect(secondRead.json()).resolves.toEqual({ configured: true, chatId: 'second-chat' })
+
+      const firstStored = await db().select().from(accountTelegramSettings).where(eq(accountTelegramSettings.accountUserId, firstAccount))
+      const secondStored = await db().select().from(accountTelegramSettings).where(eq(accountTelegramSettings.accountUserId, secondAccount))
+      expect(firstStored).toHaveLength(1)
+      expect(secondStored).toHaveLength(1)
+      expect(firstStored[0].value).not.toBe(secondStored[0].value)
+    } finally {
+      if (previousKey === undefined) delete testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY
+      else testEnv.TELEGRAM_SETTINGS_ENCRYPTION_KEY = previousKey
     }
   })
 
@@ -440,8 +472,8 @@ describe('tenant dashboard', () => {
   })
 
   it('sends queued order PDFs to the configured Telegram chat without changing the saved order', async () => {
-    await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
-    const tenant = await createTenant('NE', 'dashboard-notify-offline')
+    const user = await createUser('dashboard-notify-owner@example.com')
+    const tenant = await createTenant('NE', 'dashboard-notify-offline', user)
     const product = await createProduct(tenant, { priceSen: 800 })
     const response = await postPublicOrder('dashboard-notify-offline', {
       idempotencyKey: 'dashboard-notify-offline-order',
@@ -451,10 +483,15 @@ describe('tenant dashboard', () => {
     const { orderId } = await response.json<{ orderId: string }>()
     await db().insert(tenantSettings).values({ tenantId: tenant, orderListSendTime: '00:00' })
 
-    const previousToken = (env as unknown as { TELEGRAM_BOT_TOKEN?: string }).TELEGRAM_BOT_TOKEN
-    const previousChatId = (env as unknown as { TELEGRAM_CHAT_ID?: string }).TELEGRAM_CHAT_ID
-    ;(env as unknown as { TELEGRAM_BOT_TOKEN: string }).TELEGRAM_BOT_TOKEN = 'test-token'
-    ;(env as unknown as { TELEGRAM_CHAT_ID: string }).TELEGRAM_CHAT_ID = '123456'
+    const previousKey = (env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY
+    ;(env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY = 'test-only-encryption-key'
+    const cryptoAdmin = await createUser('dashboard-notify-platform@example.com')
+    await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, cryptoAdmin))
+    const platformTenant = await createTenant('Notification Platform Admin Store', 'dashboard-notify-platform-store')
+    await addMembership(cryptoAdmin, platformTenant, 'owner')
+    const cookie = await loginAndGetCookie('dashboard-notify-platform@example.com')
+    const save = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', { method: 'PUT', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ accountUserId: user, botToken: 'test-token', chatId: '123456' }) })
+    expect(save.status).toBe(200)
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }))
 
     await processDueNotifications(env as unknown as Env, 1000)
@@ -471,15 +508,13 @@ describe('tenant dashboard', () => {
     expect(order.totalSen).toBe(800)
     expect(order.status).toBe('pending')
     fetchSpy.mockRestore()
-    if (previousToken === undefined) delete (env as unknown as { TELEGRAM_BOT_TOKEN?: string }).TELEGRAM_BOT_TOKEN
-    else (env as unknown as { TELEGRAM_BOT_TOKEN: string }).TELEGRAM_BOT_TOKEN = previousToken
-    if (previousChatId === undefined) delete (env as unknown as { TELEGRAM_CHAT_ID?: string }).TELEGRAM_CHAT_ID
-    else (env as unknown as { TELEGRAM_CHAT_ID: string }).TELEGRAM_CHAT_ID = previousChatId
+    if (previousKey === undefined) delete (env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY
+    else (env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY = previousKey
   })
 
   it('lets an admin manually send pending orders without consuming the scheduled digest', async () => {
-    await db().delete(systemSettings).where(eq(systemSettings.key, 'telegram'))
-    const tenant = await createTenant('Manual Digest Store', 'manual-digest-store')
+    const user = await createUser('manual-digest-admin@example.com')
+    const tenant = await createTenant('Manual Digest Store', 'manual-digest-store', user)
     const product = await createProduct(tenant, { priceSen: 1250 })
     const created = await postPublicOrder('manual-digest-store', {
       idempotencyKey: 'manual-digest-order',
@@ -488,13 +523,17 @@ describe('tenant dashboard', () => {
     })
     const { orderId } = await created.json<{ orderId: string }>()
     await db().insert(tenantSettings).values({ tenantId: tenant, orderListSendTime: '23:00', orderListLastSentDate: '2099-01-01' })
-    const user = await createUser('manual-digest-admin@example.com')
     await addMembership(user, tenant, 'admin')
     const cookie = await loginAndGetCookie('manual-digest-admin@example.com')
-    const previousToken = (env as unknown as { TELEGRAM_BOT_TOKEN?: string }).TELEGRAM_BOT_TOKEN
-    const previousChatId = (env as unknown as { TELEGRAM_CHAT_ID?: string }).TELEGRAM_CHAT_ID
-    ;(env as unknown as { TELEGRAM_BOT_TOKEN: string }).TELEGRAM_BOT_TOKEN = 'test-token'
-    ;(env as unknown as { TELEGRAM_CHAT_ID: string }).TELEGRAM_CHAT_ID = '123456'
+    const previousKey = (env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY
+    ;(env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY = 'test-only-encryption-key'
+    const platformUser = await createUser('manual-digest-platform@example.com')
+    await db().update(users).set({ isPlatformAdmin: true }).where(eq(users.id, platformUser))
+    const platformTenant = await createTenant('Manual Digest Platform Admin Store', 'manual-digest-platform-store')
+    await addMembership(platformUser, platformTenant, 'owner')
+    const platformCookie = await loginAndGetCookie('manual-digest-platform@example.com')
+    const save = await SELF.fetch('https://test.local/api/dashboard/telegram-settings', { method: 'PUT', headers: { cookie: platformCookie, 'content-type': 'application/json' }, body: JSON.stringify({ accountUserId: user, botToken: 'test-token', chatId: '123456' }) })
+    expect(save.status).toBe(200)
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }))
 
     const response = await SELF.fetch('https://test.local/api/dashboard/orders/order-list/send-now', { method: 'POST', headers: { cookie } })
@@ -514,10 +553,8 @@ describe('tenant dashboard', () => {
     expect(empty.status).toBe(409)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     fetchSpy.mockRestore()
-    if (previousToken === undefined) delete (env as unknown as { TELEGRAM_BOT_TOKEN?: string }).TELEGRAM_BOT_TOKEN
-    else (env as unknown as { TELEGRAM_BOT_TOKEN: string }).TELEGRAM_BOT_TOKEN = previousToken
-    if (previousChatId === undefined) delete (env as unknown as { TELEGRAM_CHAT_ID?: string }).TELEGRAM_CHAT_ID
-    else (env as unknown as { TELEGRAM_CHAT_ID: string }).TELEGRAM_CHAT_ID = previousChatId
+    if (previousKey === undefined) delete (env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY
+    else (env as unknown as { TELEGRAM_SETTINGS_ENCRYPTION_KEY: string }).TELEGRAM_SETTINGS_ENCRYPTION_KEY = previousKey
   })
 
   it('reports missing Telegram configuration when an admin manually sends the order list', async () => {
@@ -544,5 +581,37 @@ describe('tenant dashboard', () => {
     else (env as unknown as { TELEGRAM_BOT_TOKEN: string }).TELEGRAM_BOT_TOKEN = previousToken
     if (previousChatId === undefined) delete (env as unknown as { TELEGRAM_CHAT_ID?: string }).TELEGRAM_CHAT_ID
     else (env as unknown as { TELEGRAM_CHAT_ID: string }).TELEGRAM_CHAT_ID = previousChatId
+  })
+
+  it('records unconfigured Telegram jobs without using legacy Worker credentials', async () => {
+    const tenant = await createTenant('Unconfigured Scheduled Store', 'unconfigured-scheduled-store')
+    const product = await createProduct(tenant, { priceSen: 500 })
+    const created = await postPublicOrder('unconfigured-scheduled-store', {
+      idempotencyKey: 'unconfigured-scheduled-order',
+      customer: { name: 'Unconfigured Scheduled Customer', phone: '0169999999' },
+      items: [{ productId: product, quantity: 1 }],
+    })
+    const { orderId } = await created.json<{ orderId: string }>()
+    await db().insert(tenantSettings).values({ tenantId: tenant, orderListSendTime: '00:00' })
+    const testEnv = env as unknown as { TELEGRAM_BOT_TOKEN?: string; TELEGRAM_CHAT_ID?: string }
+    const previousToken = testEnv.TELEGRAM_BOT_TOKEN
+    const previousChatId = testEnv.TELEGRAM_CHAT_ID
+    testEnv.TELEGRAM_BOT_TOKEN = 'legacy-global-token'
+    testEnv.TELEGRAM_CHAT_ID = 'legacy-global-chat'
+    const fetchSpy = vi.spyOn(globalThis, 'fetch')
+
+    try {
+      await processDueNotifications(env as unknown as Env, 1000)
+      const [job] = await db().select().from(notificationJobs).where(eq(notificationJobs.orderId, orderId)).limit(1)
+      expect(job.status).toBe('pending')
+      expect(job.errorCategory).toBe('telegram_not_configured')
+      expect(fetchSpy).not.toHaveBeenCalled()
+    } finally {
+      fetchSpy.mockRestore()
+      if (previousToken === undefined) delete testEnv.TELEGRAM_BOT_TOKEN
+      else testEnv.TELEGRAM_BOT_TOKEN = previousToken
+      if (previousChatId === undefined) delete testEnv.TELEGRAM_CHAT_ID
+      else testEnv.TELEGRAM_CHAT_ID = previousChatId
+    }
   })
 })
