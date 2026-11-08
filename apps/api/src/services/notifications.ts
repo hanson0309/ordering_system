@@ -1,7 +1,7 @@
 import { and, asc, eq, inArray, isNotNull, or } from 'drizzle-orm'
 import { createDb, type Db } from '../db/client'
-import { accountTelegramSettings, branches, customers, notificationJobs, orderItems, orders, tenantSettings, tenants } from '../db/schema'
-import { renderOrderListPdf } from './order-pdf'
+import { accountTelegramSettings, branches, customers, notificationJobs, orderItems, orders, regions, tenantSettings, tenants } from '../db/schema'
+import { loadOrderPdfFont, renderOrderListPdf } from './order-pdf'
 import { decryptSecret } from './secret-crypto'
 import type { Env } from '../types'
 
@@ -78,7 +78,7 @@ function isDue(sendTime: string | null, currentTime: string) {
 async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string; accountUserId: string | null; organizationName: string; sendTime: string | null; lastSentDate: string | null }, now: Date, force = false) {
   const parts = malaysiaDateParts(now)
   if (!force && (!isDue(setting.sendTime, parts.time) || setting.lastSentDate === parts.date)) return 0
-  const rows = await db.select({ id: orders.id, orderNumber: orders.orderNumber, createdAt: orders.createdAt, customerName: customers.name, customerPhone: customers.phone, remark: orders.remark, totalSen: orders.totalSen, branchName: branches.name }).from(orders).innerJoin(customers, and(eq(customers.id, orders.customerId), eq(customers.tenantId, setting.tenantId))).leftJoin(branches, and(eq(branches.id, orders.branchId), eq(branches.tenantId, setting.tenantId))).innerJoin(notificationJobs, and(eq(notificationJobs.orderId, orders.id), eq(notificationJobs.tenantId, setting.tenantId))).where(and(eq(orders.tenantId, setting.tenantId), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled')))).orderBy(asc(orders.createdAt))
+  const rows = await db.select({ id: orders.id, orderNumber: orders.orderNumber, createdAt: orders.createdAt, customerName: customers.name, customerPhone: customers.phone, remark: orders.remark, totalSen: orders.totalSen, regionName: regions.name, branchName: branches.name }).from(orders).innerJoin(customers, and(eq(customers.id, orders.customerId), eq(customers.tenantId, setting.tenantId))).leftJoin(branches, and(eq(branches.id, orders.branchId), eq(branches.tenantId, setting.tenantId))).leftJoin(regions, and(eq(regions.id, branches.regionId), eq(regions.tenantId, setting.tenantId))).innerJoin(notificationJobs, and(eq(notificationJobs.orderId, orders.id), eq(notificationJobs.tenantId, setting.tenantId))).where(and(eq(orders.tenantId, setting.tenantId), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled')))).orderBy(asc(orders.createdAt))
   if (rows.length === 0) {
     if (!force) await db.update(tenantSettings).set({ orderListLastSentDate: parts.date, updatedAt: new Date() }).where(eq(tenantSettings.tenantId, setting.tenantId))
     return 0
@@ -87,7 +87,8 @@ async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string
   const items = await db.select({ orderId: orderItems.orderId, productNameSnapshot: orderItems.productNameSnapshot, quantity: orderItems.quantity }).from(orderItems).where(and(eq(orderItems.tenantId, setting.tenantId), inArray(orderItems.orderId, orderIds))).orderBy(asc(orderItems.id))
   const itemsByOrder = new Map<string, Array<{ productNameSnapshot: string; quantity: number }>>()
   for (const item of items) itemsByOrder.set(item.orderId, [...(itemsByOrder.get(item.orderId) ?? []), item])
-  const pdf = await renderOrderListPdf({ organizationName: setting.organizationName, businessDate: parts.date, orders: rows.map((row) => ({ ...row, items: itemsByOrder.get(row.id) ?? [] })) })
+  const fontBytes = await loadOrderPdfFont(env.DOCS_BUCKET)
+  const pdf = await renderOrderListPdf({ organizationName: setting.organizationName, businessDate: parts.date, orders: rows.map((row) => ({ ...row, items: itemsByOrder.get(row.id) ?? [] })) }, { fontBytes })
   const telegram = await getTelegramCredentials(env, db, setting.accountUserId)
   await sendDocument({ ...telegram, pdf, filename: `order-list-${parts.date}.pdf` })
   const jobsUpdate = db.update(notificationJobs).set({ status: 'sent', lastAttemptAt: new Date(), nextRetryAt: null, errorCategory: null }).where(and(eq(notificationJobs.tenantId, setting.tenantId), inArray(notificationJobs.orderId, orderIds), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled'))))

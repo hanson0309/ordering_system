@@ -31,8 +31,7 @@ app.get('/api/health', (c) => c.json({ ok: true, environment: c.env.ENVIRONMENT 
 app.route('/api/auth', authRoutes)
 app.route('/api', membershipRoutes)
 app.route('/api/dashboard', dashboardRoutes)
-app.route('/api/public/:slug', publicRoutes)
-app.route('/api/public/:slug/:locationSlug', publicRoutes)
+app.route('/api/public/:tenantSlug/:regionSlug/:storeSlug', publicRoutes)
 
 // Generic error handler: never leak stack traces, query details, or
 // another tenant's data in error responses.

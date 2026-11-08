@@ -21,6 +21,9 @@ export interface Product {
   name: string
   imageUrl: string | null
   priceSen: number
+  serviceDate: string | null
+  servicePeriod: 'lunch' | 'dinner' | null
+  orderCutoffAt: string | null
 }
 
 export interface CreateOrderResponse {
@@ -92,26 +95,26 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export function getStore(storePath: string) {
-  return request<StoreInfo>(`/public/${storePath}`)
+  return request<StoreInfo>(storePath ? `/public/${storePath}` : '/public')
 }
 
 export function getCategories(storePath: string) {
-  return request<{ categories: Category[] }>(`/public/${storePath}/categories`)
+  return request<{ categories: Category[] }>(storePath ? `/public/${storePath}/categories` : '/public/categories')
 }
 
 export function getProducts(storePath: string) {
-  return request<{ products: Product[] }>(`/public/${storePath}/products`)
+  return request<{ products: Product[] }>(storePath ? `/public/${storePath}/products` : '/public/products')
 }
 
 export interface SubmitOrderInput {
   idempotencyKey: string
   customer: { name: string; phone: string }
   remark?: string
-  items: { productId: string; quantity: number }[]
+  items: { productId: string; quantity: number; serviceDate?: string }[]
 }
 
 export function submitOrder(storePath: string, input: SubmitOrderInput) {
-  return request<CreateOrderResponse>(`/public/${storePath}/orders`, {
+  return request<CreateOrderResponse>(`${storePath ? `/public/${storePath}` : '/public'}/orders`, {
     method: 'POST',
     body: JSON.stringify(input),
   })
@@ -120,10 +123,18 @@ export function submitOrder(storePath: string, input: SubmitOrderInput) {
 export async function uploadPaymentReceipt(storePath: string, orderId: string, file: File) {
   const form = new FormData()
   form.append('file', file)
-  const res = await fetch(`/api/public/${storePath}/orders/${orderId}/payment-receipt`, { method: 'POST', body: form })
+  const apiPath = `/api/public/${storePath}`
+  const res = await fetch(`${apiPath}/orders/${orderId}/payment-receipt`, { method: 'POST', body: form })
   const body = await res.json().catch(() => null)
   if (!res.ok) throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? 'unknown_error')
   return body as { orderId: string; uploaded: boolean }
+}
+
+export async function deletePaymentReceipt(storePath: string, orderId: string) {
+  const res = await fetch(`/api/public/${storePath}/orders/${orderId}/payment-receipt`, { method: 'DELETE' })
+  const body = await res.json().catch(() => null)
+  if (!res.ok) throw new ApiError(res.status, (body as { error?: string } | null)?.error ?? 'unknown_error')
+  return body as { orderId: string; deleted: boolean }
 }
 
 export function login(email: string, password: string) {

@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { createDb } from '../db/client'
 import { users, sessions, memberships, tenants } from '../db/schema'
 import { verifyPassword } from '../auth/password'
+import { normalizeUsername } from '../auth/username'
 import { generateSessionToken, hashSessionToken, SESSION_COOKIE_NAME, SESSION_TTL_SECONDS } from '../auth/session'
 import { newId } from '../lib/id'
 import { requireAuth } from '../auth/middleware'
@@ -13,7 +14,7 @@ import type { Env, AppVariables } from '../types'
 export const authRoutes = new Hono<{ Bindings: Env; Variables: AppVariables }>()
 
 const credentialsSchema = z.object({
-  email: z.string().email().max(255),
+  username: z.string().trim().min(1).max(32),
   password: z.string().min(8).max(256),
 })
 
@@ -57,13 +58,15 @@ authRoutes.post('/login', async (c) => {
   if (!parsed.success) {
     return c.json({ error: 'invalid_credentials' }, 401)
   }
-  const { email, password } = parsed.data
+  const { password } = parsed.data
+  const username = normalizeUsername(parsed.data.username)
+  if (!username) return c.json({ error: 'invalid_credentials' }, 401)
 
   const db = createDb(c.env)
-  const [user] = await db.select().from(users).where(eq(users.email, email)).limit(1)
+  const [user] = await db.select().from(users).where(eq(users.username, username)).limit(1)
   // Always run password verification, even for a nonexistent user, against a
   // fixed dummy hash — avoids a timing side-channel that reveals which
-  // emails are registered.
+  // usernames are registered.
   const DUMMY_HASH = 'pbkdf2:100000:00000000000000000000000000000000:00000000000000000000000000000000000000000000000000000000000000'
   const ok = await verifyPassword(password, user?.passwordHash ?? DUMMY_HASH)
   if (!user || !ok) {

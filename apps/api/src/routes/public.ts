@@ -6,8 +6,9 @@ import { branches, categories, orders, products, tenantSettings } from '../db/sc
 import { scoped } from '../repositories/scoped'
 import { resolvePublicTenant } from '../auth/middleware'
 import { createOrder, OrderValidationError } from '../services/orders'
+import { expandWeeklyProduct, getMalaysiaDate, isScheduledMeal, isWeeklyMeal, resolveEffectiveProductPrices } from '../services/scheduled-meals'
 import type { Env, AppVariables } from '../types'
-import { uploadErrorResponse, validateUpload } from '../services/uploads'
+import { isUploadFile, uploadErrorResponse, validateUpload } from '../services/uploads'
 
 export const publicRoutes = new Hono<{ Bindings: Env; Variables: AppVariables }>()
 
@@ -24,7 +25,7 @@ publicRoutes.get('/', async (c) => {
     .where(eq(tenantSettings.tenantId, tenant.id))
     .limit(1)
   const [qrBranch] = branch ? await db.select({ paymentQrKey: branches.paymentQrKey }).from(branches).where(eq(branches.id, branch.id)).limit(1) : []
-  const [defaultBranch] = !qrBranch?.paymentQrKey ? await db.select({ id: branches.id, paymentQrKey: branches.paymentQrKey }).from(branches).where(and(eq(branches.tenantId, tenant.id), eq(branches.isDefault, true))).limit(1) : []
+  const [defaultBranch] = !qrBranch?.paymentQrKey && branch ? await db.select({ id: branches.id, paymentQrKey: branches.paymentQrKey }).from(branches).where(and(eq(branches.regionId, branch.regionId), eq(branches.isDefault, true))).limit(1) : []
   const paymentQrBranchId = qrBranch?.paymentQrKey ? branch?.id : defaultBranch?.paymentQrKey ? defaultBranch.id : null
 
   return c.json({
@@ -32,7 +33,7 @@ publicRoutes.get('/', async (c) => {
     slug: tenant.slug,
     location: branch ? { slug: branch.slug, name: branch.name } : null,
     businessInfo: settings?.businessInfo ?? null,
-    paymentQrUrl: paymentQrBranchId ? `/api/public/${tenant.slug}${branch ? `/${branch.slug}` : ''}/payment-qr` : null,
+    paymentQrUrl: paymentQrBranchId && branch ? `/api/public/${tenant.slug}/${branch.regionSlug}/${branch.slug}/payment-qr` : null,
   })
 })
 
@@ -41,7 +42,7 @@ publicRoutes.get('/payment-qr', async (c) => {
   const branch = c.get('publicBranch')
   const db = createDb(c.env)
   const [selected] = branch ? await db.select({ id: branches.id, paymentQrKey: branches.paymentQrKey }).from(branches).where(and(eq(branches.id, branch.id), eq(branches.tenantId, tenant.id))).limit(1) : []
-  const [fallback] = !selected?.paymentQrKey ? await db.select({ id: branches.id, paymentQrKey: branches.paymentQrKey }).from(branches).where(and(eq(branches.tenantId, tenant.id), eq(branches.isDefault, true))).limit(1) : []
+  const [fallback] = !selected?.paymentQrKey && branch ? await db.select({ id: branches.id, paymentQrKey: branches.paymentQrKey }).from(branches).where(and(eq(branches.regionId, branch.regionId), eq(branches.isDefault, true))).limit(1) : []
   const key = selected?.paymentQrKey ?? fallback?.paymentQrKey
   if (!key) return c.json({ error: 'not_found' }, 404)
   const object = await c.env.DOCS_BUCKET.get(key)
@@ -75,13 +76,38 @@ publicRoutes.get('/products', async (c) => {
       name: products.name,
       imageUrl: products.imageUrl,
       priceSen: products.priceSen,
+      serviceDate: products.serviceDate,
+      servicePeriod: products.servicePeriod,
+      orderCutoffAt: products.orderCutoffAt,
+      weeklyDay: products.weeklyDay,
+      weeklyCutoffTime: products.weeklyCutoffTime,
+      isPublic: products.isPublic,
+      isAvailable: products.isAvailable,
     })
     .from(products)
     .where(
       scoped(products, tenant.id, and(eq(products.isPublic, true), eq(products.isAvailable, true), branch ? eq(products.branchId, branch.id) : isNull(products.branchId))),
     )
 
-  return c.json({ products: rows })
+  const ordinaryProducts = rows.filter((product) => !isScheduledMeal(product))
+  const scheduledRows = rows.filter(isScheduledMeal).filter((product) => !branch?.deliveryPeriod || product.servicePeriod === branch.deliveryPeriod)
+  const weeklyRows = scheduledRows.filter(isWeeklyMeal)
+  const malaysiaToday = getMalaysiaDate(new Date())
+  const datedRows = scheduledRows.filter((product) => !isWeeklyMeal(product) && product.serviceDate === malaysiaToday)
+  const expandedWeeklyRows = branch ? weeklyRows.flatMap((product) => expandWeeklyProduct(product, malaysiaToday, 1)) : []
+  const scheduledProducts = branch
+    ? await resolveEffectiveProductPrices(db, tenant.id, branch.id, [...datedRows, ...expandedWeeklyRows])
+    : []
+  return c.json({
+    products: [
+      ...ordinaryProducts.map(({ isPublic, isAvailable, weeklyDay, weeklyCutoffTime, ...product }) => product),
+      ...scheduledProducts.map(({ effectivePriceSen, pricingRuleName, isPublic, isAvailable, weeklyDay, weeklyCutoffTime, ...product }) => ({
+        ...product,
+        priceSen: effectivePriceSen,
+        orderCutoffAt: product.orderCutoffAt?.toISOString() ?? null,
+      })),
+    ],
+  })
 })
 
 const createOrderSchema = z.object({
@@ -96,6 +122,7 @@ const createOrderSchema = z.object({
       z.object({
         productId: z.string().min(1),
         quantity: z.number().int().min(1).max(100),
+        serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         options: z.record(z.string(), z.unknown()).optional(),
       }),
     )
@@ -144,7 +171,7 @@ publicRoutes.post('/orders/:orderId/payment-receipt', async (c) => {
   if (!order) return c.json({ error: 'not_found' }, 404)
   const body = await c.req.parseBody()
   const file = body.file
-  if (!(file instanceof File)) return c.json({ error: 'invalid_file' }, 400)
+  if (!isUploadFile(file)) return c.json({ error: 'invalid_file' }, 400)
   const validated = await validateUpload(file, 'receipt')
   const uploadError = uploadErrorResponse(validated)
   if (uploadError) return c.json({ error: uploadError.error }, uploadError.status as 400 | 413)
@@ -154,4 +181,23 @@ publicRoutes.post('/orders/:orderId/payment-receipt', async (c) => {
   if (order.paymentReceiptKey && order.paymentReceiptKey !== key) await c.env.DOCS_BUCKET.delete(order.paymentReceiptKey)
   await db.update(orders).set({ paymentReceiptKey: key, paymentReceiptContentType: validated.contentType, paymentReceiptUploadedAt: new Date() }).where(scoped(orders, tenant.id, eq(orders.id, orderId)))
   return c.json({ orderId, uploaded: true })
+})
+
+publicRoutes.delete('/orders/:orderId/payment-receipt', async (c) => {
+  const tenant = c.get('publicTenant')
+  const branch = c.get('publicBranch')
+  const orderId = c.req.param('orderId')
+  const db = createDb(c.env)
+  const [order] = await db
+    .select({ id: orders.id, paymentReceiptKey: orders.paymentReceiptKey })
+    .from(orders)
+    .where(scoped(orders, tenant.id, and(eq(orders.id, orderId), branch ? eq(orders.branchId, branch.id) : isNull(orders.branchId))))
+    .limit(1)
+  if (!order?.paymentReceiptKey) return c.json({ error: 'not_found' }, 404)
+
+  await db.update(orders)
+    .set({ paymentReceiptKey: null, paymentReceiptContentType: null, paymentReceiptUploadedAt: null })
+    .where(scoped(orders, tenant.id, eq(orders.id, orderId)))
+  await c.env.DOCS_BUCKET.delete(order.paymentReceiptKey)
+  return c.json({ orderId, deleted: true })
 })

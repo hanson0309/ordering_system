@@ -1,7 +1,8 @@
-import { and, asc, desc, eq, gte, isNull, lt, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, gte, inArray, isNull, lt, sql } from 'drizzle-orm'
 import { Hono, type Context } from 'hono'
 import { z } from 'zod'
 import { requireAuth, requirePlatformAdmin, requireRole, requireTenant } from '../auth/middleware'
+import { normalizeUsername } from '../auth/username'
 import { hashPassword } from '../auth/password'
 import { createDb } from '../db/client'
 import {
@@ -16,6 +17,9 @@ import {
   orders,
   productImages,
   products,
+  pricingRules,
+  regions,
+  scheduledMealPrices,
   sessions,
   tenantSettings,
   tenants,
@@ -23,10 +27,11 @@ import {
 } from '../db/schema'
 import { newId } from '../lib/id'
 import { scoped } from '../repositories/scoped'
-import { renderOrderPdf } from '../services/order-pdf'
+import { loadOrderPdfFont, renderOrderPdf } from '../services/order-pdf'
 import { sendOrderListNow, sendTelegramTestMessage, TelegramError } from '../services/notifications'
 import { decryptSecret, encryptSecret } from '../services/secret-crypto'
-import { uploadErrorResponse, validateUpload } from '../services/uploads'
+import { isUploadFile, uploadErrorResponse, validateUpload } from '../services/uploads'
+import { parseMalaysiaCutoff } from '../services/scheduled-meals'
 import type { AppVariables, Env } from '../types'
 
 export const dashboardRoutes = new Hono<{ Bindings: Env; Variables: AppVariables }>()
@@ -37,13 +42,6 @@ dashboardRoutes.use('*', requireAuth, requireTenant)
 const orderStatuses = ['pending', 'confirmed', 'preparing', 'completed', 'cancelled'] as const
 const statusSchema = z.object({ status: z.enum(orderStatuses) })
 
-const createStoreSchema = z.object({
-  name: z.string().trim().min(1).max(120),
-  slug: z.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
-  design: z.enum(['clean', 'midnight', 'warm']).default('clean'),
-  tagline: z.string().trim().max(160).optional(),
-})
-
 const allowedTransitions: Record<(typeof orderStatuses)[number], readonly string[]> = {
   pending: ['confirmed', 'cancelled'],
   confirmed: ['preparing', 'cancelled'],
@@ -52,41 +50,8 @@ const allowedTransitions: Record<(typeof orderStatuses)[number], readonly string
   cancelled: [],
 }
 
-dashboardRoutes.post('/stores', requireRole('owner'), async (c) => {
-  const parsed = createStoreSchema.safeParse(await c.req.json().catch(() => null))
-  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
-
-  const auth = c.get('auth')
-  const db = createDb(c.env)
-  const [existingSlug] = await db.select({ id: tenants.id }).from(tenants).where(eq(tenants.slug, parsed.data.slug)).limit(1)
-  if (existingSlug) return c.json({ error: 'slug_taken' }, 409)
-
-  const tenantId = newId('tenant')
-  const membershipId = newId('mem')
-  try {
-    await db.batch([
-      db.insert(tenants).values({ id: tenantId, accountUserId: auth.userId, name: parsed.data.name, slug: parsed.data.slug, status: 'active' }),
-      db.insert(memberships).values({ id: membershipId, userId: auth.userId, tenantId, role: 'owner' }),
-      db.insert(tenantSettings).values({
-        tenantId,
-        businessInfo: {
-          design: parsed.data.design,
-          tagline: parsed.data.tagline ?? null,
-        },
-      }),
-    ])
-  } catch (err) {
-    if (String(err).includes('tenants_slug_unique')) return c.json({ error: 'slug_taken' }, 409)
-    throw err
-  }
-
-  return c.json({
-    organization: { tenantId, name: parsed.data.name, slug: parsed.data.slug, role: 'owner' },
-  }, 201)
-})
-
 const createDashboardUserSchema = z.object({
-  email: z.string().trim().email().max(320),
+  username: z.string().trim().min(1).max(32),
   password: z.string().min(8).max(200),
   role: z.enum(['admin', 'staff', 'viewer']),
 })
@@ -96,11 +61,18 @@ const updateDashboardUserSchema = z.object({
   password: z.string().min(8).max(200).optional(),
 }).refine((value) => value.role !== undefined || value.password !== undefined)
 
+const pricingRuleSchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  isActive: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).max(10000).optional(),
+})
+const branchPricingRuleSchema = z.object({ pricingRuleId: z.string().min(1).nullable() })
+
 dashboardRoutes.get('/users', requirePlatformAdmin, async (c) => {
   const rows = await createDb(c.env)
     .select({
       id: users.id,
-      email: users.email,
+      username: users.username,
       role: memberships.role,
       tenantId: tenants.id,
       tenantName: tenants.name,
@@ -110,7 +82,7 @@ dashboardRoutes.get('/users', requirePlatformAdmin, async (c) => {
     .innerJoin(users, eq(users.id, memberships.userId))
     .innerJoin(tenants, eq(tenants.id, memberships.tenantId))
     .where(eq(users.isPlatformAdmin, false))
-    .orderBy(asc(tenants.name), asc(users.email))
+    .orderBy(asc(tenants.name), asc(users.username))
   const currentUserId = c.get('auth').userId
   return c.json({ users: rows.map((row) => ({ ...row, isCurrentUser: row.id === currentUserId })) })
 })
@@ -119,32 +91,34 @@ dashboardRoutes.post('/users', requirePlatformAdmin, async (c) => {
   const parsed = createDashboardUserSchema.safeParse(await c.req.json().catch(() => null))
   if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
 
-  const email = parsed.data.email.toLowerCase()
+  const username = normalizeUsername(parsed.data.username)
+  if (!username) return c.json({ error: 'invalid_input' }, 400)
+  const email = `${username}@internal.invalid`
   const db = createDb(c.env)
-  const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.email, email)).limit(1)
-  if (existing) return c.json({ error: 'email_taken' }, 409)
+  const [existing] = await db.select({ id: users.id }).from(users).where(eq(users.username, username)).limit(1)
+  if (existing) return c.json({ error: 'username_taken' }, 409)
 
   const userId = newId('user')
   const membershipId = newId('mem')
   const tenantId = newId('tenant')
   const tenantSlug = `account-${userId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`
-  const tenantName = email.slice(0, email.indexOf('@')) || 'Account'
+  const tenantName = username
   const passwordHash = await hashPassword(parsed.data.password)
   try {
     await db.batch([
-      db.insert(users).values({ id: userId, email, passwordHash }),
+      db.insert(users).values({ id: userId, username, email, passwordHash }),
       db.insert(tenants).values({ id: tenantId, accountUserId: userId, name: tenantName, slug: tenantSlug, status: 'active' }),
       db.insert(memberships).values({ id: membershipId, userId, tenantId, role: parsed.data.role }),
       db.insert(tenantSettings).values({ tenantId, businessInfo: { design: 'clean' } }),
     ])
   } catch (err) {
-    if (String(err).includes('users_email_unique')) return c.json({ error: 'email_taken' }, 409)
+    if (String(err).includes('users_username_unique')) return c.json({ error: 'username_taken' }, 409)
     if (String(err).includes('tenants_slug_unique')) return c.json({ error: 'slug_taken' }, 409)
     throw err
   }
 
   return c.json({
-    user: { id: userId, email, role: parsed.data.role },
+    user: { id: userId, username, role: parsed.data.role },
     membership: { id: membershipId, tenantId, role: parsed.data.role },
     organization: { tenantId, name: tenantName, slug: tenantSlug },
   }, 201)
@@ -160,7 +134,7 @@ dashboardRoutes.patch('/users/:userId', requirePlatformAdmin, async (c) => {
 
   const db = createDb(c.env)
   const [target] = await db
-    .select({ userId: memberships.userId, tenantId: memberships.tenantId, email: users.email, role: memberships.role })
+    .select({ userId: memberships.userId, tenantId: memberships.tenantId, username: users.username, role: memberships.role })
     .from(memberships)
     .innerJoin(users, eq(users.id, memberships.userId))
     .where(and(eq(memberships.userId, userId), eq(users.isPlatformAdmin, false)))
@@ -178,27 +152,134 @@ dashboardRoutes.patch('/users/:userId', requirePlatformAdmin, async (c) => {
   await db.batch(statements as [any, ...any[]])
 
   return c.json({
-    user: { id: userId, email: target.email, role: parsed.data.role ?? target.role },
+    user: { id: userId, username: target.username, role: parsed.data.role ?? target.role },
     updated: { role: parsed.data.role !== undefined, password: parsed.data.password !== undefined },
   })
 })
 
 const branchSchema = z.object({
+  regionId: z.string().min(1),
   name: z.string().trim().min(1).max(120),
   slug: z.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
   address: z.string().trim().max(240).nullable().optional(),
+  deliveryPeriod: z.enum(['lunch', 'dinner']).nullable().optional(),
   syncDefault: z.boolean().default(false),
   makeDefault: z.boolean().default(false),
 })
 
-dashboardRoutes.get('/branches', async (c) => {
+const regionSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  slug: z.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
+})
+
+dashboardRoutes.get('/regions', async (c) => {
   const tenantId = c.get('tenant').tenantId
   const rows = await createDb(c.env)
-    .select({ id: branches.id, name: branches.name, slug: branches.slug, address: branches.address, isDefault: branches.isDefault, paymentQrKey: branches.paymentQrKey })
+    .select({ id: regions.id, tenantId: regions.tenantId, name: regions.name, slug: regions.slug, isDefault: regions.isDefault })
+    .from(regions)
+    .where(eq(regions.tenantId, tenantId))
+    .orderBy(desc(regions.isDefault), asc(regions.name))
+  return c.json({ regions: rows })
+})
+
+dashboardRoutes.post('/regions', requireRole('admin'), async (c) => {
+  const parsed = regionSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  const tenantId = c.get('tenant').tenantId
+  const db = createDb(c.env)
+  const [existing] = await db.select({ id: regions.id }).from(regions)
+    .where(and(eq(regions.tenantId, tenantId), eq(regions.slug, parsed.data.slug))).limit(1)
+  if (existing) return c.json({ error: 'slug_taken' }, 409)
+  const region = { id: newId('region'), tenantId, name: parsed.data.name, slug: parsed.data.slug, isDefault: false }
+  await db.insert(regions).values(region)
+  return c.json({ region }, 201)
+})
+
+dashboardRoutes.get('/branches', async (c) => {
+  const tenantId = c.get('tenant').tenantId
+  const regionId = c.req.query('regionId')
+  if (regionId) {
+    const [region] = await createDb(c.env).select({ id: regions.id }).from(regions)
+      .where(and(eq(regions.id, regionId), eq(regions.tenantId, tenantId))).limit(1)
+    if (!region) return c.json({ error: 'not_found' }, 404)
+  }
+  const rows = await createDb(c.env)
+    .select({ id: branches.id, tenantId: branches.tenantId, regionId: branches.regionId, name: branches.name, slug: branches.slug, address: branches.address, isDefault: branches.isDefault, pricingRuleId: branches.pricingRuleId, deliveryPeriod: branches.deliveryPeriod, paymentQrKey: branches.paymentQrKey })
     .from(branches)
-    .where(eq(branches.tenantId, tenantId))
+    .where(and(eq(branches.tenantId, tenantId), regionId ? eq(branches.regionId, regionId) : undefined))
     .orderBy(desc(branches.isDefault), asc(branches.name))
   return c.json({ branches: rows.map(({ paymentQrKey, ...row }) => ({ ...row, hasPaymentQr: Boolean(paymentQrKey) })) })
+})
+
+dashboardRoutes.get('/pricing-rules', async (c) => {
+  const tenantId = c.get('tenant').tenantId
+  const rows = await createDb(c.env)
+    .select()
+    .from(pricingRules)
+    .where(eq(pricingRules.tenantId, tenantId))
+    .orderBy(asc(pricingRules.sortOrder), asc(pricingRules.name))
+  return c.json({ pricingRules: rows })
+})
+
+dashboardRoutes.post('/pricing-rules', requireRole('admin'), async (c) => {
+  const parsed = pricingRuleSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  const tenantId = c.get('tenant').tenantId
+  const rule = {
+    id: newId('price-rule'),
+    tenantId,
+    name: parsed.data.name,
+    isActive: parsed.data.isActive ?? true,
+    sortOrder: parsed.data.sortOrder ?? 0,
+  }
+  try {
+    await createDb(c.env).insert(pricingRules).values(rule)
+  } catch {
+    return c.json({ error: 'name_taken' }, 409)
+  }
+  return c.json({ pricingRule: rule }, 201)
+})
+
+dashboardRoutes.patch('/pricing-rules/:pricingRuleId', requireRole('admin'), async (c) => {
+  const parsed = pricingRuleSchema.partial().safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success || Object.keys(parsed.data).length === 0) return c.json({ error: 'invalid_input' }, 400)
+  const tenantId = c.get('tenant').tenantId
+  const result = await createDb(c.env)
+    .update(pricingRules)
+    .set({ ...parsed.data, updatedAt: new Date() })
+    .where(and(eq(pricingRules.id, c.req.param('pricingRuleId')), eq(pricingRules.tenantId, tenantId)))
+  if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  return c.json({ pricingRuleId: c.req.param('pricingRuleId'), ...parsed.data })
+})
+
+dashboardRoutes.delete('/pricing-rules/:pricingRuleId', requireRole('admin'), async (c) => {
+  const tenantId = c.get('tenant').tenantId
+  const pricingRuleId = c.req.param('pricingRuleId')
+  const db = createDb(c.env)
+  const [branchReference, priceReference] = await Promise.all([
+    db.select({ id: branches.id }).from(branches).where(and(eq(branches.tenantId, tenantId), eq(branches.pricingRuleId, pricingRuleId))).limit(1),
+    db.select({ id: scheduledMealPrices.id }).from(scheduledMealPrices).where(and(eq(scheduledMealPrices.tenantId, tenantId), eq(scheduledMealPrices.pricingRuleId, pricingRuleId))).limit(1),
+  ])
+  if (branchReference.length > 0 || priceReference.length > 0) return c.json({ error: 'pricing_rule_in_use' }, 409)
+  const result = await db.delete(pricingRules).where(and(eq(pricingRules.id, pricingRuleId), eq(pricingRules.tenantId, tenantId)))
+  if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  return c.json({ deleted: true })
+})
+
+dashboardRoutes.patch('/branches/:branchId/pricing-rule', requireRole('admin'), async (c) => {
+  const parsed = branchPricingRuleSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  const tenantId = c.get('tenant').tenantId
+  const db = createDb(c.env)
+  if (parsed.data.pricingRuleId) {
+    const [rule] = await db.select({ id: pricingRules.id }).from(pricingRules)
+      .where(and(eq(pricingRules.id, parsed.data.pricingRuleId), eq(pricingRules.tenantId, tenantId))).limit(1)
+    if (!rule) return c.json({ error: 'invalid_pricing_rule' }, 400)
+  }
+  const result = await db.update(branches).set({ pricingRuleId: parsed.data.pricingRuleId })
+    .where(and(eq(branches.id, c.req.param('branchId')), eq(branches.tenantId, tenantId)))
+  if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  return c.json({ branchId: c.req.param('branchId'), pricingRuleId: parsed.data.pricingRuleId })
 })
 
 dashboardRoutes.post('/branches', requireRole('admin'), async (c) => {
@@ -206,14 +287,16 @@ dashboardRoutes.post('/branches', requireRole('admin'), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
   const tenantId = c.get('tenant').tenantId
   const db = createDb(c.env)
-  const [existingSlug] = await db.select({ id: branches.id }).from(branches).where(and(eq(branches.tenantId, tenantId), eq(branches.slug, parsed.data.slug))).limit(1)
+  const [region] = await db.select({ id: regions.id }).from(regions).where(and(eq(regions.id, parsed.data.regionId), eq(regions.tenantId, tenantId))).limit(1)
+  if (!region) return c.json({ error: 'not_found' }, 404)
+  const [existingSlug] = await db.select({ id: branches.id }).from(branches).where(and(eq(branches.regionId, parsed.data.regionId), eq(branches.slug, parsed.data.slug))).limit(1)
   if (existingSlug) return c.json({ error: 'slug_taken' }, 409)
-  const [existingDefault] = await db.select({ id: branches.id }).from(branches).where(and(eq(branches.tenantId, tenantId), eq(branches.isDefault, true))).limit(1)
+  const [existingDefault] = await db.select({ id: branches.id }).from(branches).where(and(eq(branches.regionId, parsed.data.regionId), eq(branches.isDefault, true))).limit(1)
   const branchId = newId('branch')
   const makeDefault = parsed.data.makeDefault || !existingDefault
   const statements: any[] = []
   if (makeDefault && existingDefault) statements.push(db.update(branches).set({ isDefault: false }).where(eq(branches.id, existingDefault.id)))
-  statements.push(db.insert(branches).values({ id: branchId, tenantId, name: parsed.data.name, slug: parsed.data.slug, address: parsed.data.address ?? null, isDefault: makeDefault }))
+  statements.push(db.insert(branches).values({ id: branchId, tenantId, regionId: parsed.data.regionId, name: parsed.data.name, slug: parsed.data.slug, address: parsed.data.address ?? null, deliveryPeriod: parsed.data.deliveryPeriod ?? null, isDefault: makeDefault }))
 
   if (parsed.data.syncDefault) {
     const sourceBranchId = existingDefault?.id ?? null
@@ -225,17 +308,17 @@ dashboardRoutes.post('/branches', requireRole('admin'), async (c) => {
     if (sourceProducts.length > 0) statements.push(db.insert(products).values(sourceProducts.map((product) => ({ id: newId('prod'), tenantId, branchId, categoryId: product.categoryId ? categoryMap.get(product.categoryId) ?? null : null, name: product.name, imageUrl: product.imageUrl, priceSen: product.priceSen, isPublic: product.isPublic, isAvailable: product.isAvailable }))))
   }
   await db.batch(statements as [any, ...any[]])
-  return c.json({ branch: { id: branchId, tenantId, name: parsed.data.name, slug: parsed.data.slug, address: parsed.data.address ?? null, isDefault: makeDefault }, syncedDefault: parsed.data.syncDefault }, 201)
+  return c.json({ branch: { id: branchId, tenantId, regionId: parsed.data.regionId, name: parsed.data.name, slug: parsed.data.slug, address: parsed.data.address ?? null, deliveryPeriod: parsed.data.deliveryPeriod ?? null, isDefault: makeDefault }, syncedDefault: parsed.data.syncDefault }, 201)
 })
 
 dashboardRoutes.post('/branches/:branchId/default', requireRole('admin'), async (c) => {
   const tenantId = c.get('tenant').tenantId
   const branchId = c.req.param('branchId')
-  const [branch] = await createDb(c.env).select({ id: branches.id }).from(branches).where(and(eq(branches.id, branchId), eq(branches.tenantId, tenantId))).limit(1)
+  const [branch] = await createDb(c.env).select({ id: branches.id, regionId: branches.regionId }).from(branches).where(and(eq(branches.id, branchId), eq(branches.tenantId, tenantId))).limit(1)
   if (!branch) return c.json({ error: 'not_found' }, 404)
   const db = createDb(c.env)
   await db.batch([
-    db.update(branches).set({ isDefault: false }).where(eq(branches.tenantId, tenantId)),
+    db.update(branches).set({ isDefault: false }).where(eq(branches.regionId, branch.regionId)),
     db.update(branches).set({ isDefault: true }).where(eq(branches.id, branchId)),
   ])
   return c.json({ branchId, isDefault: true })
@@ -249,7 +332,7 @@ dashboardRoutes.post('/branches/:branchId/payment-qr', requireRole('admin'), asy
   if (!branch) return c.json({ error: 'not_found' }, 404)
   const body = await c.req.parseBody()
   const file = body.file
-  if (!(file instanceof File)) return c.json({ error: 'invalid_file' }, 400)
+  if (!isUploadFile(file)) return c.json({ error: 'invalid_file' }, 400)
   const validated = await validateUpload(file, 'qr')
   const uploadError = uploadErrorResponse(validated)
   if (uploadError) return c.json({ error: uploadError.error }, uploadError.status as 400 | 413)
@@ -312,6 +395,10 @@ async function resolveBranch(c: DashboardContext): Promise<{ id: string; tenantI
 
 function branchPredicate<T extends { branchId: any }>(table: T, branchId: string | null) {
   return branchId ? eq(table.branchId, branchId) : isNull(table.branchId)
+}
+
+function optionalOrderBranchPredicate<T extends { branchId: any }>(table: T, branchId: string | null) {
+  return branchId ? eq(table.branchId, branchId) : undefined
 }
 
 const MALAYSIA_OFFSET_MS = 8 * 60 * 60 * 1000
@@ -406,7 +493,7 @@ dashboardRoutes.get('/orders', async (c) => {
   if (status === null) return c.json({ error: 'invalid_status' }, 400)
   const { limit, offset } = parsePagination(c)
   const db = createDb(c.env)
-  const predicate = scoped(orders, tenantId, and(branchPredicate(orders, branchId), status ? eq(orders.status, status) : undefined))
+  const predicate = scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), status ? eq(orders.status, status) : undefined))
 
   const rows = await db
     .select({
@@ -420,6 +507,9 @@ dashboardRoutes.get('/orders', async (c) => {
       remark: orders.remark,
       hasPaymentReceipt: orders.paymentReceiptKey,
       notificationStatus: notificationJobs.status,
+      notificationError: notificationJobs.errorCategory,
+      regionName: regions.name,
+      branchName: branches.name,
     })
     .from(orders)
     .innerJoin(
@@ -429,6 +519,14 @@ dashboardRoutes.get('/orders', async (c) => {
     .leftJoin(
       notificationJobs,
       and(eq(notificationJobs.orderId, orders.id), eq(notificationJobs.tenantId, tenantId)),
+    )
+    .leftJoin(
+      branches,
+      and(eq(branches.id, orders.branchId), eq(branches.tenantId, tenantId)),
+    )
+    .leftJoin(
+      regions,
+      and(eq(regions.id, branches.regionId), eq(regions.tenantId, tenantId)),
     )
     .where(predicate)
     .orderBy(desc(orders.createdAt), desc(orders.id))
@@ -490,7 +588,7 @@ dashboardRoutes.get('/orders/:orderId', async (c) => {
       customers,
       and(eq(customers.id, orders.customerId), eq(customers.tenantId, tenantId)),
     )
-    .where(scoped(orders, tenantId, and(branchPredicate(orders, branchId), eq(orders.id, orderId))))
+    .where(scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), eq(orders.id, orderId))))
     .limit(1)
 
   if (!order) return c.json({ error: 'not_found' }, 404)
@@ -525,7 +623,7 @@ dashboardRoutes.get('/orders/:orderId/payment-receipt', async (c) => {
   const [order] = await createDb(c.env)
     .select({ orderNumber: orders.orderNumber, paymentReceiptKey: orders.paymentReceiptKey, paymentReceiptContentType: orders.paymentReceiptContentType })
     .from(orders)
-    .where(scoped(orders, tenantId, and(branchPredicate(orders, branch?.id ?? null), eq(orders.id, orderId))))
+    .where(scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branch?.id ?? null), eq(orders.id, orderId))))
     .limit(1)
   if (!order?.paymentReceiptKey) return c.json({ error: 'not_found' }, 404)
   const object = await c.env.DOCS_BUCKET.get(order.paymentReceiptKey)
@@ -561,7 +659,7 @@ dashboardRoutes.get('/orders/:orderId/pdf', requireRole('staff'), async (c) => {
       and(eq(customers.id, orders.customerId), eq(customers.tenantId, tenantId)),
     )
     .innerJoin(tenants, eq(tenants.id, tenantId))
-    .where(scoped(orders, tenantId, and(branchPredicate(orders, branchId), eq(orders.id, orderId))))
+    .where(scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), eq(orders.id, orderId))))
     .limit(1)
 
   if (!row) return c.json({ error: 'not_found' }, 404)
@@ -575,7 +673,7 @@ dashboardRoutes.get('/orders/:orderId/pdf', requireRole('staff'), async (c) => {
     .where(scoped(orderItems, tenantId, eq(orderItems.orderId, orderId)))
     .orderBy(asc(orderItems.id))
 
-  const key = `private/${tenantId}/orders/${orderId}.pdf`
+  const key = `private/${tenantId}/orders/${orderId}-v2.pdf`
   const cached = await c.env.DOCS_BUCKET.get(key)
   if (cached) {
     return new Response(cached.body, {
@@ -587,7 +685,8 @@ dashboardRoutes.get('/orders/:orderId/pdf', requireRole('staff'), async (c) => {
     })
   }
 
-  const pdf = await renderOrderPdf({ ...row, items })
+  const fontBytes = await loadOrderPdfFont(c.env.DOCS_BUCKET)
+  const pdf = await renderOrderPdf({ ...row, items }, { fontBytes })
   await c.env.DOCS_BUCKET.put(key, pdf, {
     httpMetadata: { contentType: 'application/pdf' },
   })
@@ -614,7 +713,7 @@ dashboardRoutes.patch('/orders/:orderId/status', requireRole('staff'), async (c)
   const [order] = await db
     .select({ id: orders.id, status: orders.status })
     .from(orders)
-    .where(scoped(orders, tenantId, and(branchPredicate(orders, branchId), eq(orders.id, orderId))))
+    .where(scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), eq(orders.id, orderId))))
     .limit(1)
 
   if (!order) return c.json({ error: 'not_found' }, 404)
@@ -626,7 +725,7 @@ dashboardRoutes.patch('/orders/:orderId/status', requireRole('staff'), async (c)
     db
       .update(orders)
       .set({ status: parsed.data.status })
-      .where(scoped(orders, tenantId, and(branchPredicate(orders, branchId), eq(orders.id, orderId)))),
+      .where(scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), eq(orders.id, orderId)))),
     db.insert(auditLogs).values({
       id: newId('audit'),
       tenantId,
@@ -651,7 +750,7 @@ dashboardRoutes.post('/orders/:orderId/notification/retry', requireRole('staff')
   const [order] = await db
     .select({ id: orders.id })
     .from(orders)
-    .where(scoped(orders, tenantId, and(branchPredicate(orders, branchId), eq(orders.id, orderId))))
+    .where(scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), eq(orders.id, orderId))))
     .limit(1)
   if (!order) return c.json({ error: 'not_found' }, 404)
   const [job] = await db
@@ -745,6 +844,11 @@ dashboardRoutes.get('/products', async (c) => {
       priceSen: products.priceSen,
       isPublic: products.isPublic,
       isAvailable: products.isAvailable,
+      serviceDate: products.serviceDate,
+      servicePeriod: products.servicePeriod,
+      orderCutoffAt: products.orderCutoffAt,
+      weeklyDay: products.weeklyDay,
+      weeklyCutoffTime: products.weeklyCutoffTime,
     })
     .from(products)
     .leftJoin(
@@ -753,7 +857,14 @@ dashboardRoutes.get('/products', async (c) => {
     )
     .where(scoped(products, tenantId, branchPredicate(products, branchId)))
     .orderBy(asc(products.name))
-  return c.json({ products: rows })
+  const prices = rows.length
+    ? await db.select({ productId: scheduledMealPrices.productId, pricingRuleId: scheduledMealPrices.pricingRuleId, priceSen: scheduledMealPrices.priceSen })
+      .from(scheduledMealPrices)
+      .where(and(eq(scheduledMealPrices.tenantId, tenantId), inArray(scheduledMealPrices.productId, rows.map((row) => row.id))))
+    : []
+  const pricesByProductId = new Map<string, { pricingRuleId: string; priceSen: number }[]>()
+  for (const price of prices) pricesByProductId.set(price.productId, [...(pricesByProductId.get(price.productId) ?? []), price])
+  return c.json({ products: rows.map((row) => ({ ...row, rulePrices: pricesByProductId.get(row.id) ?? [] })) })
 })
 
 const productSchema = z.object({
@@ -763,7 +874,55 @@ const productSchema = z.object({
   categoryId: z.string().min(1).nullable().optional(),
   isPublic: z.boolean().optional(),
   isAvailable: z.boolean().optional(),
+  kind: z.enum(['add_on', 'scheduled_meal', 'recurring_meal']).optional(),
+  serviceDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  servicePeriod: z.enum(['lunch', 'dinner']).optional(),
+  cutoffMalaysiaTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+  weeklyDay: z.number().int().min(1).max(5).optional(),
+  weeklyCutoffTime: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/).optional(),
+  rulePrices: z.array(z.object({ pricingRuleId: z.string().min(1), priceSen: z.number().int().min(0).max(100000000) })).optional(),
 })
+
+function normalizeEmptyScheduleFields(body: unknown) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return body
+  const normalized = { ...(body as Record<string, unknown>) }
+  for (const field of ['serviceDate', 'servicePeriod', 'cutoffMalaysiaTime', 'weeklyDay', 'weeklyCutoffTime']) {
+    if (normalized[field] === '') delete normalized[field]
+  }
+  return normalized
+}
+
+async function buildScheduledMealValues(db: ReturnType<typeof createDb>, tenantId: string, branchId: string | null, data: z.infer<typeof productSchema>) {
+  if (data.kind === 'add_on') return { serviceDate: null, servicePeriod: null, orderCutoffAt: null, weeklyDay: null, weeklyCutoffTime: null, rulePrices: [] as { pricingRuleId: string; priceSen: number }[] }
+  const recurring = data.kind === 'recurring_meal'
+  if ((!recurring && data.kind !== 'scheduled_meal') || !data.servicePeriod || !data.rulePrices) return null
+  if (recurring ? data.weeklyDay === undefined || !data.weeklyCutoffTime : !data.serviceDate || !data.cutoffMalaysiaTime) return null
+  if (new Set(data.rulePrices.map((price) => price.pricingRuleId)).size !== data.rulePrices.length) return null
+
+  const [branchRule] = branchId
+    ? await db.select({ id: pricingRules.id }).from(pricingRules).innerJoin(branches, eq(branches.pricingRuleId, pricingRules.id))
+      .where(and(eq(branches.id, branchId), eq(branches.tenantId, tenantId), eq(pricingRules.tenantId, tenantId), eq(pricingRules.isActive, true))).limit(1)
+    : []
+  if (!branchRule || !data.rulePrices.some((price) => price.pricingRuleId === branchRule.id)) return null
+
+  const activeRules = await db.select({ id: pricingRules.id }).from(pricingRules)
+    .where(and(eq(pricingRules.tenantId, tenantId), eq(pricingRules.isActive, true)))
+  const activeRuleIds = new Set(activeRules.map((rule) => rule.id))
+  if (data.rulePrices.some((price) => !activeRuleIds.has(price.pricingRuleId))) return null
+
+  try {
+    return {
+      serviceDate: data.serviceDate,
+      servicePeriod: data.servicePeriod,
+      orderCutoffAt: recurring ? null : parseMalaysiaCutoff(data.serviceDate!, data.cutoffMalaysiaTime!),
+      weeklyDay: recurring ? data.weeklyDay! : null,
+      weeklyCutoffTime: recurring ? data.weeklyCutoffTime! : null,
+      rulePrices: data.rulePrices,
+    }
+  } catch {
+    return null
+  }
+}
 
 async function ensureCategory(c: DashboardContext, categoryId: string | null | undefined, tenantId: string) {
   if (categoryId === undefined || categoryId === null) return true
@@ -778,12 +937,15 @@ async function ensureCategory(c: DashboardContext, categoryId: string | null | u
 }
 
 dashboardRoutes.post('/products', requireRole('admin'), async (c) => {
-  const parsed = productSchema.safeParse(await c.req.json().catch(() => null))
+  const parsed = productSchema.safeParse(normalizeEmptyScheduleFields(await c.req.json().catch(() => null)))
   if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
   const tenantId = c.get('tenant').tenantId
   const branch = await resolveBranch(c)
   if (branch === false) return c.json({ error: 'not_found' }, 404)
   if (!(await ensureCategory(c, parsed.data.categoryId, tenantId))) return c.json({ error: 'invalid_category' }, 400)
+  const db = createDb(c.env)
+  const schedule = await buildScheduledMealValues(db, tenantId, branch?.id ?? null, parsed.data)
+  if (parsed.data.kind && parsed.data.kind !== 'add_on' && !schedule) return c.json({ error: 'invalid_scheduled_meal' }, 400)
   const id = newId('prod')
   const values = {
     id,
@@ -795,24 +957,55 @@ dashboardRoutes.post('/products', requireRole('admin'), async (c) => {
     categoryId: parsed.data.categoryId ?? null,
     isPublic: parsed.data.isPublic ?? true,
     isAvailable: parsed.data.isAvailable ?? true,
+    serviceDate: schedule?.serviceDate ?? null,
+    servicePeriod: schedule?.servicePeriod ?? null,
+    orderCutoffAt: schedule?.orderCutoffAt ?? null,
+    weeklyDay: schedule?.weeklyDay ?? null,
+    weeklyCutoffTime: schedule?.weeklyCutoffTime ?? null,
   }
-  await createDb(c.env).insert(products).values(values)
+  await db.insert(products).values(values)
+  if (schedule?.rulePrices.length) {
+    await db.insert(scheduledMealPrices).values(schedule.rulePrices.map((price) => ({
+      id: newId('scheduled-price'), tenantId, productId: id, ...price,
+    })))
+  }
   return c.json({ product: values }, 201)
 })
 
 dashboardRoutes.patch('/products/:productId', requireRole('admin'), async (c) => {
-  const parsed = productSchema.partial().safeParse(await c.req.json().catch(() => null))
+  const parsed = productSchema.partial().safeParse(normalizeEmptyScheduleFields(await c.req.json().catch(() => null)))
   if (!parsed.success || Object.keys(parsed.data).length === 0) return c.json({ error: 'invalid_input' }, 400)
   const tenantId = c.get('tenant').tenantId
   const branch = await resolveBranch(c)
   if (branch === false) return c.json({ error: 'not_found' }, 404)
   const productId = c.req.param('productId')
   if (!(await ensureCategory(c, parsed.data.categoryId, tenantId))) return c.json({ error: 'invalid_category' }, 400)
-  const result = await createDb(c.env)
+  const db = createDb(c.env)
+  const schedule = parsed.data.kind
+    ? await buildScheduledMealValues(db, tenantId, branch?.id ?? null, parsed.data as z.infer<typeof productSchema>)
+    : undefined
+  if (parsed.data.kind && parsed.data.kind !== 'add_on' && !schedule) return c.json({ error: 'invalid_scheduled_meal' }, 400)
+  const { kind: _kind, cutoffMalaysiaTime: _cutoffMalaysiaTime, rulePrices: _rulePrices, ...productData } = parsed.data
+  const result = await db
     .update(products)
-    .set(parsed.data)
+    .set({
+      ...productData,
+      ...(schedule ? {
+        serviceDate: schedule.serviceDate,
+        servicePeriod: schedule.servicePeriod,
+        orderCutoffAt: schedule.orderCutoffAt,
+        weeklyDay: schedule.weeklyDay,
+        weeklyCutoffTime: schedule.weeklyCutoffTime,
+      } : {}),
+    })
     .where(scoped(products, tenantId, and(branchPredicate(products, branch?.id ?? null), eq(products.id, productId))))
   if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  if (parsed.data.kind) {
+    await db.delete(scheduledMealPrices).where(and(eq(scheduledMealPrices.tenantId, tenantId), eq(scheduledMealPrices.productId, productId)))
+    if (schedule?.rulePrices.length) await db.insert(scheduledMealPrices).values(schedule.rulePrices.map((price) => ({
+      id: newId('scheduled-price'), tenantId, productId, ...price,
+    })))
+  }
   return c.json({ productId, ...parsed.data })
 })
 
@@ -827,8 +1020,10 @@ dashboardRoutes.delete('/products/:productId', requireRole('admin'), async (c) =
   if (!product) return c.json({ error: 'not_found' }, 404)
 
   const imageScope = and(eq(productImages.tenantId, tenantId), eq(productImages.productId, productId))
+  const scheduledPriceScope = and(eq(scheduledMealPrices.tenantId, tenantId), eq(scheduledMealPrices.productId, productId))
   const images = await db.select({ r2Key: productImages.r2Key }).from(productImages).where(imageScope)
-  const [, deletedProduct] = await db.batch([
+  const [, , deletedProduct] = await db.batch([
+    db.delete(scheduledMealPrices).where(scheduledPriceScope),
     db.delete(productImages).where(imageScope),
     db.delete(products).where(productScope),
   ])
@@ -888,12 +1083,12 @@ dashboardRoutes.patch('/settings', requireRole('admin'), async (c) => {
 
 dashboardRoutes.get('/telegram-accounts', requirePlatformAdmin, async (c) => {
   const rows = await createDb(c.env)
-    .select({ id: users.id, email: users.email, configured: accountTelegramSettings.accountUserId })
+    .select({ id: users.id, username: users.username, configured: accountTelegramSettings.accountUserId })
     .from(users)
     .leftJoin(accountTelegramSettings, eq(accountTelegramSettings.accountUserId, users.id))
     .where(eq(users.isPlatformAdmin, false))
-    .orderBy(asc(users.email))
-  return c.json({ accounts: rows.map((row) => ({ id: row.id, email: row.email, configured: Boolean(row.configured) })) })
+    .orderBy(asc(users.username))
+  return c.json({ accounts: rows.map((row) => ({ id: row.id, username: row.username, configured: Boolean(row.configured) })) })
 })
 
 async function resolveTelegramAccount(c: DashboardContext, accountUserId: string | undefined) {

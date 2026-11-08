@@ -29,6 +29,7 @@ export const tenants = sqliteTable('tenants', {
 export const users = sqliteTable('users', {
   id: text('id').primaryKey(),
   email: text('email').notNull(),
+  username: text('username'),
   passwordHash: text('password_hash').notNull(),
   // Platform-level cross-tenant permission. Never implied by any
   // tenant-scoped role; must be explicitly granted out of band.
@@ -59,22 +60,51 @@ export const memberships = sqliteTable('memberships', {
   index('memberships_tenant_idx').on(table.tenantId),
 ])
 
+export const regions = sqliteTable('regions', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  name: text('name').notNull(),
+  slug: text('slug').notNull(),
+  isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
+}, (table) => [
+  uniqueIndex('regions_tenant_slug_unique').on(table.tenantId, table.slug),
+  index('regions_tenant_idx').on(table.tenantId),
+])
+
+export const pricingRules = sqliteTable('pricing_rules', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  name: text('name').notNull(),
+  isActive: integer('is_active', { mode: 'boolean' }).notNull().default(true),
+  sortOrder: integer('sort_order').notNull().default(0),
+  createdAt: integer('created_at', { mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
+  updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
+}, (table) => [
+  uniqueIndex('pricing_rules_tenant_name_unique').on(table.tenantId, table.name),
+  index('pricing_rules_tenant_sort_idx').on(table.tenantId, table.sortOrder),
+])
+
 export const branches = sqliteTable('branches', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id')
     .notNull()
     .references(() => tenants.id),
+  regionId: text('region_id').notNull().references(() => regions.id),
   name: text('name').notNull(),
   slug: text('slug'),
   address: text('address'),
   paymentQrKey: text('payment_qr_key'),
   isDefault: integer('is_default', { mode: 'boolean' }).notNull().default(false),
+  pricingRuleId: text('pricing_rule_id').references(() => pricingRules.id),
+  deliveryPeriod: text('delivery_period', { enum: ['lunch', 'dinner'] }),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
 }, (table) => [
   index('branches_tenant_idx').on(table.tenantId),
-  uniqueIndex('branches_tenant_slug_unique').on(table.tenantId, table.slug),
+  index('branches_region_idx').on(table.regionId),
+  uniqueIndex('branches_region_slug_unique').on(table.regionId, table.slug),
 ])
 
 export const tenantSettings = sqliteTable('tenant_settings', {
@@ -161,6 +191,11 @@ export const products = sqliteTable('products', {
   priceSen: integer('price_sen').notNull(),
   isPublic: integer('is_public', { mode: 'boolean' }).notNull().default(true),
   isAvailable: integer('is_available', { mode: 'boolean' }).notNull().default(true),
+  serviceDate: text('service_date'),
+  servicePeriod: text('service_period', { enum: ['lunch', 'dinner'] }),
+  orderCutoffAt: integer('order_cutoff_at', { mode: 'timestamp' }),
+  weeklyDay: integer('weekly_day'),
+  weeklyCutoffTime: text('weekly_cutoff_time'),
   createdAt: integer('created_at', { mode: 'timestamp' })
     .notNull()
     .default(sql`(unixepoch())`),
@@ -168,6 +203,18 @@ export const products = sqliteTable('products', {
   index('products_tenant_idx').on(table.tenantId),
   index('products_branch_idx').on(table.tenantId, table.branchId),
   index('products_tenant_category_idx').on(table.tenantId, table.categoryId),
+])
+
+export const scheduledMealPrices = sqliteTable('scheduled_meal_prices', {
+  id: text('id').primaryKey(),
+  tenantId: text('tenant_id').notNull().references(() => tenants.id),
+  productId: text('product_id').notNull().references(() => products.id),
+  pricingRuleId: text('pricing_rule_id').notNull().references(() => pricingRules.id),
+  priceSen: integer('price_sen').notNull(),
+}, (table) => [
+  uniqueIndex('scheduled_meal_prices_product_rule_unique').on(table.productId, table.pricingRuleId),
+  index('scheduled_meal_prices_tenant_idx').on(table.tenantId),
+  index('scheduled_meal_prices_rule_idx').on(table.pricingRuleId),
 ])
 
 export const productImages = sqliteTable('product_images', {
@@ -252,6 +299,9 @@ export const orderItems = sqliteTable('order_items', {
   unitPriceSenSnapshot: integer('unit_price_sen_snapshot').notNull(),
   quantity: integer('quantity').notNull(),
   optionsSnapshot: text('options_snapshot', { mode: 'json' }),
+  serviceDateSnapshot: text('service_date_snapshot'),
+  servicePeriodSnapshot: text('service_period_snapshot', { enum: ['lunch', 'dinner'] }),
+  pricingRuleNameSnapshot: text('pricing_rule_name_snapshot'),
 }, (table) => [
   index('order_items_tenant_idx').on(table.tenantId),
   index('order_items_order_idx').on(table.orderId),

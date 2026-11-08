@@ -6,11 +6,15 @@ export interface CartLine {
   quantity: number
 }
 
+export function cartLineKey(product: Product): string {
+  return `${product.id}:${product.serviceDate ?? ''}`
+}
+
 interface CartState {
   lines: CartLine[]
   addItem: (product: Product, quantity?: number) => void
-  removeItem: (productId: string) => void
-  setQuantity: (productId: string, quantity: number) => void
+  removeItem: (product: Product) => void
+  setQuantity: (product: Product, quantity: number) => void
   clear: () => void
   totalSen: number
   totalItems: number
@@ -39,23 +43,26 @@ export function CartProvider({ slug, children }: { slug: string; children: React
   const value = useMemo<CartState>(() => {
     const addItem = (product: Product, quantity = 1) => {
       setLines((prev) => {
-        const existing = prev.find((l) => l.product.id === product.id)
+        const key = cartLineKey(product)
+        const existing = prev.find((l) => cartLineKey(l.product) === key)
         if (existing) {
           return prev.map((l) =>
-            l.product.id === product.id ? { ...l, quantity: l.quantity + quantity } : l,
+            cartLineKey(l.product) === key ? { ...l, quantity: l.quantity + quantity } : l,
           )
         }
         return [...prev, { product, quantity }]
       })
     }
-    const removeItem = (productId: string) => {
-      setLines((prev) => prev.filter((l) => l.product.id !== productId))
+    const removeItem = (product: Product) => {
+      const key = cartLineKey(product)
+      setLines((prev) => prev.filter((l) => cartLineKey(l.product) !== key))
     }
-    const setQuantity = (productId: string, quantity: number) => {
+    const setQuantity = (product: Product, quantity: number) => {
+      const key = cartLineKey(product)
       setLines((prev) =>
         quantity <= 0
-          ? prev.filter((l) => l.product.id !== productId)
-          : prev.map((l) => (l.product.id === productId ? { ...l, quantity } : l)),
+          ? prev.filter((l) => cartLineKey(l.product) !== key)
+          : prev.map((l) => (cartLineKey(l.product) === key ? { ...l, quantity } : l)),
       )
     }
     const clear = () => setLines([])

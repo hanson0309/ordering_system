@@ -41,6 +41,7 @@ bucket_name = "ordering-system-docs-prod"
 
 [env.production.vars]
 ENVIRONMENT = "production"
+PUBLIC_TENANT_SLUG = "kk"
 
 [env.production.triggers]
 crons = ["*/5 * * * *"]

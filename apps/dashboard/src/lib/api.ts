@@ -34,7 +34,7 @@ export interface Organization {
 
 export interface DashboardUser {
   id: string
-  email: string
+  username: string
   role: 'owner' | 'admin' | 'staff' | 'viewer'
   tenantId?: string
   tenantName?: string
@@ -62,8 +62,11 @@ export interface DashboardOrder {
   customerName: string
   customerPhone: string
   remark: string | null
+  regionName: string | null
+  branchName: string | null
   hasPaymentReceipt: boolean
   notificationStatus: string | null
+  notificationError: string | null
 }
 
 export interface DashboardProduct {
@@ -75,6 +78,19 @@ export interface DashboardProduct {
   priceSen: number
   isPublic: boolean
   isAvailable: boolean
+  serviceDate: string | null
+  servicePeriod: 'lunch' | 'dinner' | null
+  orderCutoffAt: string | null
+  weeklyDay: number | null
+  weeklyCutoffTime: string | null
+  rulePrices: { pricingRuleId: string; priceSen: number }[]
+}
+
+export interface DashboardPricingRule {
+  id: string
+  name: string
+  isActive: boolean
+  sortOrder: number
 }
 
 export interface DashboardCategory {
@@ -85,11 +101,22 @@ export interface DashboardCategory {
 
 export interface DashboardBranch {
   id: string
+  regionId: string
   name: string
   slug: string | null
   address: string | null
   isDefault: boolean
   hasPaymentQr: boolean
+  pricingRuleId?: string | null
+  deliveryPeriod?: 'lunch' | 'dinner' | null
+}
+
+export interface DashboardRegion {
+  id: string
+  tenantId: string
+  name: string
+  slug: string
+  isDefault: boolean
 }
 
 export class ApiError extends Error {
@@ -139,10 +166,10 @@ export function submitOrder(slug: string, input: SubmitOrderInput) {
   })
 }
 
-export function login(email: string, password: string) {
+export function login(username: string, password: string) {
   return request<{ userId: string }>('/auth/login', {
     method: 'POST',
-    body: JSON.stringify({ email, password }),
+    body: JSON.stringify({ username, password }),
   })
 }
 
@@ -156,7 +183,7 @@ export function getOrganizations() {
 
 export interface TelegramAccount {
   id: string
-  email: string
+  username: string
   configured: boolean
 }
 
@@ -176,23 +203,11 @@ export function testTelegramSettings(accountUserId: string) {
   return request<{ sent: true }>('/dashboard/telegram-settings/test', { method: 'POST', body: JSON.stringify({ accountUserId }) })
 }
 
-export function createDashboardStore(input: {
-  name: string
-  slug: string
-  design: 'clean' | 'midnight' | 'warm'
-  tagline?: string
-}) {
-  return request<{ organization: Organization }>('/dashboard/stores', {
-    method: 'POST',
-    body: JSON.stringify(input),
-  })
-}
-
 export function getDashboardUsers() {
   return request<{ users: DashboardUser[] }>('/dashboard/users')
 }
 
-export function createDashboardUser(input: { email: string; password: string; role: 'admin' | 'staff' | 'viewer' }) {
+export function createDashboardUser(input: { username: string; password: string; role: 'admin' | 'staff' | 'viewer' }) {
   return request<{ user: DashboardUser; membership: { id: string; tenantId: string; role: DashboardUser['role'] } }>('/dashboard/users', {
     method: 'POST',
     body: JSON.stringify(input),
@@ -217,11 +232,41 @@ function branchSuffix(branchId?: string | null) {
   return branchId ? `?branchId=${encodeURIComponent(branchId)}` : ''
 }
 
-export function getDashboardBranches() {
-  return request<{ branches: DashboardBranch[] }>('/dashboard/branches')
+export function getDashboardRegions() {
+  return request<{ regions: DashboardRegion[] }>('/dashboard/regions')
 }
 
-export function createDashboardBranch(input: { name: string; slug: string; address?: string | null; syncDefault: boolean; makeDefault: boolean }) {
+export function createDashboardRegion(input: { name: string; slug: string }) {
+  return request<{ region: DashboardRegion }>('/dashboard/regions', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function getDashboardBranches(regionId?: string | null) {
+  return request<{ branches: DashboardBranch[] }>(`/dashboard/branches${regionId ? `?regionId=${encodeURIComponent(regionId)}` : ''}`)
+}
+
+export function getDashboardPricingRules() {
+  return request<{ pricingRules: DashboardPricingRule[] }>('/dashboard/pricing-rules')
+}
+
+export function createDashboardPricingRule(input: { name: string; isActive?: boolean; sortOrder?: number }) {
+  return request<{ pricingRule: DashboardPricingRule }>('/dashboard/pricing-rules', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function updateDashboardPricingRule(pricingRuleId: string, input: Partial<{ name: string; isActive: boolean; sortOrder: number }>) {
+  return request<{ pricingRuleId: string }>(`/dashboard/pricing-rules/${pricingRuleId}`, { method: 'PATCH', body: JSON.stringify(input) })
+}
+
+export function deleteDashboardPricingRule(pricingRuleId: string) {
+  return request<{ deleted: true }>(`/dashboard/pricing-rules/${pricingRuleId}`, { method: 'DELETE' })
+}
+
+export function assignDashboardBranchPricingRule(branchId: string, pricingRuleId: string | null) {
+  return request<{ branchId: string; pricingRuleId: string | null }>(`/dashboard/branches/${branchId}/pricing-rule`, {
+    method: 'PATCH', body: JSON.stringify({ pricingRuleId }),
+  })
+}
+
+export function createDashboardBranch(input: { regionId: string; name: string; slug: string; address?: string | null; deliveryPeriod?: 'lunch' | 'dinner' | null; syncDefault: boolean; makeDefault: boolean }) {
   return request<{ branch: DashboardBranch; syncedDefault: boolean }>('/dashboard/branches', { method: 'POST', body: JSON.stringify(input) })
 }
 
@@ -317,6 +362,13 @@ export function createDashboardProduct(input: {
   categoryId: string | null
   isPublic: boolean
   isAvailable: boolean
+  kind?: 'add_on' | 'scheduled_meal' | 'recurring_meal'
+  serviceDate?: string
+  servicePeriod?: 'lunch' | 'dinner'
+  cutoffMalaysiaTime?: string
+  weeklyDay?: number
+  weeklyCutoffTime?: string
+  rulePrices?: { pricingRuleId: string; priceSen: number }[]
   branchId?: string | null
 }) {
   const suffix = branchSuffix(input.branchId)
@@ -334,6 +386,13 @@ export function updateDashboardProduct(productId: string, input: Partial<{
   categoryId: string | null
   isPublic: boolean
   isAvailable: boolean
+  kind: 'add_on' | 'scheduled_meal' | 'recurring_meal'
+  serviceDate: string
+  servicePeriod: 'lunch' | 'dinner'
+  cutoffMalaysiaTime: string
+  weeklyDay: number
+  weeklyCutoffTime: string
+  rulePrices: { pricingRuleId: string; priceSen: number }[]
 }>, branchId?: string | null) {
   return request<{ productId: string }>(`/dashboard/products/${productId}${branchSuffix(branchId)}`, {
     method: 'PATCH',

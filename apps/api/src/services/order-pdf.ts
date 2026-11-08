@@ -1,4 +1,7 @@
-import { PDFDocument, StandardFonts, rgb } from 'pdf-lib'
+import fontkit from '@pdf-lib/fontkit'
+import { PDFDocument, StandardFonts, degrees, rgb } from 'pdf-lib'
+
+export const ORDER_PDF_FONT_KEY = 'system/fonts/Deng.ttf'
 
 export interface OrderPdfData {
   organizationName: string
@@ -16,21 +19,47 @@ export interface OrderPdfData {
   }>
 }
 
-// Standard PDF fonts do not contain CJK glyphs. Keep the document readable
-// for every runtime by replacing unsupported characters rather than emitting
-// malformed font data. A future branded PDF can embed an approved font file.
-function pdfText(value: string): string {
+export function pdfText(value: string): string {
+  return value
+}
+
+function fallbackPdfText(value: string): string {
   return value.normalize('NFKD').replace(/[^\x20-\x7e]/g, '?')
+}
+
+export function formatMalaysiaDateTime(value: Date): string {
+  const local = new Date(value.getTime() + 8 * 60 * 60 * 1000)
+  return `${local.getUTCFullYear()}-${String(local.getUTCMonth() + 1).padStart(2, '0')}-${String(local.getUTCDate()).padStart(2, '0')} ${String(local.getUTCHours()).padStart(2, '0')}:${String(local.getUTCMinutes()).padStart(2, '0')}:${String(local.getUTCSeconds()).padStart(2, '0')} MYT`
+}
+
+export async function loadOrderPdfFont(bucket: R2Bucket): Promise<Uint8Array | undefined> {
+  const object = await bucket.get(ORDER_PDF_FONT_KEY)
+  return object ? new Uint8Array(await object.arrayBuffer()) : undefined
+}
+
+interface PdfRenderOptions {
+  fontBytes?: Uint8Array
+}
+
+async function createFonts(document: PDFDocument, fontBytes?: Uint8Array) {
+  if (fontBytes) {
+    document.registerFontkit(fontkit)
+    const font = await document.embedFont(fontBytes, { subset: true })
+    return { regular: font, bold: font }
+  }
+  return {
+    regular: await document.embedFont(StandardFonts.Helvetica),
+    bold: await document.embedFont(StandardFonts.HelveticaBold),
+  }
 }
 
 function money(sen: number): string {
   return `RM ${(sen / 100).toFixed(2)}`
 }
 
-export async function renderOrderPdf(data: OrderPdfData): Promise<Uint8Array> {
+export async function renderOrderPdf(data: OrderPdfData, options: PdfRenderOptions = {}): Promise<Uint8Array> {
   const document = await PDFDocument.create()
-  const regular = await document.embedFont(StandardFonts.Helvetica)
-  const bold = await document.embedFont(StandardFonts.HelveticaBold)
+  const { regular, bold } = await createFonts(document, options.fontBytes)
   const pageWidth = 595
   const pageHeight = 842
   const margin = 44
@@ -44,7 +73,7 @@ export async function renderOrderPdf(data: OrderPdfData): Promise<Uint8Array> {
     }
   }
   const draw = (text: string, x: number, size: number, font = regular, color = rgb(0.12, 0.16, 0.23)) => {
-    page.drawText(pdfText(text), { x, y, size, font, color })
+    page.drawText(options.fontBytes ? pdfText(text) : fallbackPdfText(text), { x, y, size, font, color })
   }
 
   draw(data.organizationName, margin, 20, bold, rgb(0.05, 0.08, 0.14))
@@ -57,7 +86,7 @@ export async function renderOrderPdf(data: OrderPdfData): Promise<Uint8Array> {
   draw(`Order: ${data.orderNumber}`, margin, 11, bold)
   draw(`Status: ${data.status}`, pageWidth - margin - 130, 11, regular)
   y -= 19
-  draw(`Created: ${data.createdAt.toISOString()}`, margin, 10, regular, rgb(0.38, 0.42, 0.5))
+  draw(`Created: ${formatMalaysiaDateTime(data.createdAt)}`, margin, 10, regular, rgb(0.38, 0.42, 0.5))
   y -= 29
 
   draw('Customer', margin, 11, bold)
@@ -111,64 +140,214 @@ export interface OrderListPdfRow {
   customerPhone: string
   remark: string | null
   totalSen: number
+  regionName: string | null
   branchName: string | null
   items: Array<{ productNameSnapshot: string; quantity: number }>
 }
 
-export async function renderOrderListPdf(data: { organizationName: string; businessDate: string; orders: OrderListPdfRow[] }): Promise<Uint8Array> {
+export interface RegionOrderListGroup {
+  name: string
+  stores: Array<{
+    name: string
+    orders: OrderListPdfRow[]
+  }>
+}
+
+export function groupOrderListRows(rows: OrderListPdfRow[]): RegionOrderListGroup[] {
+  const regionsByName = new Map<string, Map<string, OrderListPdfRow[]>>()
+
+  for (const row of rows) {
+    const regionName = row.regionName ?? 'Unassigned region'
+    const storeName = row.branchName ?? 'General'
+    const storesByName = regionsByName.get(regionName) ?? new Map<string, OrderListPdfRow[]>()
+    storesByName.set(storeName, [...(storesByName.get(storeName) ?? []), row])
+    regionsByName.set(regionName, storesByName)
+  }
+
+  return [...regionsByName].map(([name, storesByName]) => ({
+    name,
+    stores: [...storesByName].map(([storeName, orders]) => ({ name: storeName, orders })),
+  }))
+}
+
+export function formatOrderListAddOns(order: Pick<OrderListPdfRow, 'items' | 'remark'>): string {
+  const products = order.items.map((item) => `${item.productNameSnapshot} x${item.quantity}`)
+  if (order.remark) products.push(`Remark: ${order.remark}`)
+  return products.join('; ') || '-'
+}
+
+export async function renderOrderListPdf(data: { organizationName: string; businessDate: string; orders: OrderListPdfRow[] }, options: PdfRenderOptions = {}): Promise<Uint8Array> {
   const document = await PDFDocument.create()
-  const regular = await document.embedFont(StandardFonts.Helvetica)
-  const bold = await document.embedFont(StandardFonts.HelveticaBold)
-  const pageWidth = 595
-  const pageHeight = 842
-  const margin = 36
-  let page = document.addPage([pageWidth, pageHeight])
-  let y = pageHeight - margin
+  const { regular, bold } = await createFonts(document, options.fontBytes)
+  const pageWidth = 842
+  const pageHeight = 595
+  const margin = 28
+  const columnCount = 4
+  const rowCount = 2
+  const cardGap = 10
+  const cardHeight = 205
+  const cardsPerPage = columnCount * rowCount
+  const cardWidth = (pageWidth - margin * 2 - cardGap * (columnCount - 1)) / columnCount
   const muted = rgb(0.38, 0.42, 0.5)
-  const line = rgb(0.85, 0.87, 0.9)
-  const addPageIfNeeded = (height: number) => {
-    if (y - height < margin) {
+  const dark = rgb(0.12, 0.12, 0.12)
+  const cardFill = rgb(1, 0.91, 0.62)
+  const gridLine = rgb(0.9, 0.83, 0.59)
+  const textColor = rgb(0.08, 0.1, 0.14)
+  const safeText = (value: string) => options.fontBytes ? pdfText(value) : fallbackPdfText(value)
+  const truncate = (value: string, maxWidth: number, size: number, font = regular) => {
+    const text = safeText(value)
+    if (font.widthOfTextAtSize(text, size) <= maxWidth) return text
+    const suffix = '...'
+    let end = text.length
+    while (end > 0 && font.widthOfTextAtSize(`${text.slice(0, end)}${suffix}`, size) > maxWidth) end -= 1
+    return end > 0 ? `${text.slice(0, end)}${suffix}` : suffix
+  }
+  const draw = (page: ReturnType<PDFDocument['addPage']>, text: string, x: number, y: number, size: number, font = regular, color = textColor, maxWidth?: number) => {
+    page.drawText(maxWidth === undefined ? safeText(text) : truncate(text, maxWidth, size, font), { x, y, size, font, color })
+  }
+  const wrapText = (value: string, maxWidth: number, size: number, font = regular) => {
+    const text = safeText(value)
+    const lines: string[] = []
+    let line = ''
+
+    const appendWord = (word: string) => {
+      const candidate = line ? `${line} ${word}` : word
+      if (font.widthOfTextAtSize(candidate, size) <= maxWidth) {
+        line = candidate
+        return
+      }
+
+      if (line) lines.push(line)
+      line = ''
+      for (const character of word) {
+        if (line && font.widthOfTextAtSize(line + character, size) > maxWidth) {
+          lines.push(line)
+          line = character
+        } else {
+          line += character
+        }
+      }
+    }
+
+    for (const paragraph of text.split('\n')) {
+      for (const word of paragraph.trim().split(/\s+/).filter(Boolean)) appendWord(word)
+      lines.push(line)
+      line = ''
+    }
+    if (text.endsWith('\n')) lines.push('')
+    return lines
+  }
+
+  const drawPageHeader = (page: ReturnType<PDFDocument['addPage']>, regionName: string, pageNumber: number) => {
+    draw(page, data.organizationName, margin, pageHeight - margin - 2, 18, bold, textColor, 360)
+    draw(page, `Order dispatch - ${data.businessDate}`, margin, pageHeight - margin - 24, 10, regular, muted, 330)
+    const totalText = `TOTAL ORDERS: ${data.orders.length}`
+    draw(page, totalText, pageWidth - margin - bold.widthOfTextAtSize(totalText, 11), pageHeight - margin - 15, 11, bold, dark)
+    page.drawLine({ start: { x: margin, y: pageHeight - margin - 34 }, end: { x: pageWidth - margin, y: pageHeight - margin - 34 }, thickness: 1, color: rgb(0.73, 0.75, 0.79) })
+    draw(page, `REGION: ${regionName}`, margin, pageHeight - margin - 55, 12, bold, dark, pageWidth - margin * 2 - 70)
+    draw(page, `Page ${pageNumber}`, pageWidth - margin - 44, pageHeight - margin - 55, 9, regular, muted)
+  }
+
+  const drawCard = (page: ReturnType<PDFDocument['addPage']>, storeName: string, ordersInCard: OrderListPdfRow[], column: number, row: number) => {
+    const x = margin + column * (cardWidth + cardGap)
+    const top = pageHeight - margin - 74 - row * (cardHeight + cardGap)
+    const y = top - cardHeight
+    const labelWidth = 17
+    const contentX = x + labelWidth
+    const contentWidth = cardWidth - labelWidth
+    const headerHeight = 17
+    const rowHeight = 13
+    const nameWidth = 46
+    const packetWidth = 29
+    const addOnsWidth = contentWidth - nameWidth - packetWidth
+    const headerY = y + cardHeight - headerHeight
+
+    page.drawRectangle({ x, y, width: cardWidth, height: cardHeight, color: cardFill, borderColor: gridLine, borderWidth: 0.5 })
+    page.drawRectangle({ x, y, width: labelWidth, height: cardHeight, color: dark })
+    const verticalName = truncate(storeName, cardHeight - 12, 8, bold)
+    page.drawText(verticalName, { x: x + 5, y: y + 6, size: 8, font: bold, color: rgb(1, 1, 1), rotate: degrees(90) })
+    page.drawRectangle({ x: contentX, y: headerY, width: contentWidth, height: headerHeight, color: dark })
+
+    draw(page, 'Name', contentX + 3, headerY + 4, 7, bold, rgb(1, 1, 1), nameWidth - 6)
+    draw(page, 'Packet', contentX + nameWidth + 2, headerY + 4, 7, bold, rgb(1, 1, 1), packetWidth - 4)
+    draw(page, 'Add-Ons', contentX + nameWidth + packetWidth + 3, headerY + 4, 7, bold, rgb(1, 1, 1), addOnsWidth - 6)
+
+    for (let index = 0; index < 14; index += 1) {
+      const rowY = headerY - (index + 1) * rowHeight
+      page.drawLine({ start: { x: contentX, y: rowY }, end: { x: x + cardWidth, y: rowY }, thickness: 0.35, color: gridLine })
+      page.drawLine({ start: { x: contentX + nameWidth, y: rowY }, end: { x: contentX + nameWidth, y: rowY + rowHeight }, thickness: 0.35, color: gridLine })
+      page.drawLine({ start: { x: contentX + nameWidth + packetWidth, y: rowY }, end: { x: contentX + nameWidth + packetWidth, y: rowY + rowHeight }, thickness: 0.35, color: gridLine })
+    }
+
+    for (let index = 0; index < ordersInCard.length; index += 1) {
+      const order = ordersInCard[index]
+      const rowY = headerY - (index + 1) * rowHeight
+      const packetCount = order.items.reduce((total, item) => total + item.quantity, 0)
+      draw(page, order.customerName, contentX + 3, rowY + 3, 7, regular, textColor, nameWidth - 6)
+      draw(page, String(packetCount), contentX + nameWidth + 9, rowY + 3, 7, regular, textColor, packetWidth - 10)
+      draw(page, formatOrderListAddOns(order), contentX + nameWidth + packetWidth + 3, rowY + 3, 7, regular, textColor, addOnsWidth - 6)
+    }
+  }
+
+  const groups = groupOrderListRows(data.orders)
+  if (groups.length === 0) {
+    const page = document.addPage([pageWidth, pageHeight])
+    drawPageHeader(page, 'No region', 1)
+    draw(page, 'No pending orders', margin, pageHeight - margin - 88, 11, regular, muted)
+  }
+
+  let pageNumber = 0
+  for (const group of groups) {
+    const cards = group.stores.flatMap((store) => {
+      const cardsForStore: Array<{ name: string; orders: OrderListPdfRow[] }> = []
+      for (let start = 0; start < store.orders.length; start += 14) {
+        cardsForStore.push({ name: store.name, orders: store.orders.slice(start, start + 14) })
+      }
+      return cardsForStore
+    })
+
+    for (let start = 0; start < cards.length; start += cardsPerPage) {
+      pageNumber += 1
+      const page = document.addPage([pageWidth, pageHeight])
+      drawPageHeader(page, group.name, pageNumber)
+      for (const [index, card] of cards.slice(start, start + cardsPerPage).entries()) {
+        drawCard(page, card.name, card.orders, index % columnCount, Math.floor(index / columnCount))
+      }
+    }
+
+    const remarks = group.stores.flatMap((store) => store.orders
+      .filter((order) => order.remark?.trim())
+      .map((order) => ({ storeName: store.name, order })))
+    if (remarks.length === 0) continue
+
+    let page: ReturnType<PDFDocument['addPage']> | null = null
+    let cursorY = 0
+    const startRemarkPage = () => {
+      pageNumber += 1
       page = document.addPage([pageWidth, pageHeight])
-      y = pageHeight - margin
+      drawPageHeader(page, group.name, pageNumber)
+      draw(page, 'CUSTOMER REMARK DETAILS', margin, pageHeight - margin - 82, 11, bold, dark)
+      cursorY = pageHeight - margin - 101
+    }
+
+    startRemarkPage()
+    for (const { storeName, order } of remarks) {
+      const heading = `${storeName} | ${order.customerName} | ${order.orderNumber}`
+      const remarkLines = wrapText(order.remark!.trim(), pageWidth - margin * 2 - 8, 9)
+      const blockHeight = 14 + remarkLines.length * 12 + 8
+      if (cursorY - blockHeight < margin) startRemarkPage()
+
+      page!.drawText(safeText(heading), { x: margin, y: cursorY, size: 9, font: bold, color: dark })
+      cursorY -= 14
+      for (const line of remarkLines) {
+        if (cursorY < margin + 12) startRemarkPage()
+        page!.drawText(line, { x: margin + 8, y: cursorY, size: 9, font: regular, color: muted })
+        cursorY -= 12
+      }
+      cursorY -= 8
+      page!.drawLine({ start: { x: margin, y: cursorY + 3 }, end: { x: pageWidth - margin, y: cursorY + 3 }, thickness: 0.4, color: gridLine })
     }
   }
-  const draw = (text: string, x: number, size: number, font = regular, color = rgb(0.12, 0.16, 0.23)) => {
-    page.drawText(pdfText(text), { x, y, size, font, color })
-  }
-  const itemText = (items: OrderListPdfRow['items']) => items.map((item) => `${item.productNameSnapshot} x${item.quantity}`).join(', ')
 
-  draw(data.organizationName, margin, 20, bold, rgb(0.05, 0.08, 0.14))
-  y -= 27
-  draw(`Order list - ${data.businessDate}`, margin, 11, regular, muted)
-  y -= 23
-  draw(`Orders: ${data.orders.length}`, margin, 10, regular, muted)
-  y -= 20
-  page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 1, color: line })
-  y -= 20
-
-  for (const order of data.orders) {
-    addPageIfNeeded(98)
-    draw(`${order.orderNumber}  ${order.createdAt.toISOString()}`, margin, 10, bold)
-    y -= 15
-    draw(`${order.customerName}  ${order.customerPhone}`, margin, 9)
-    y -= 14
-    if (order.branchName) {
-      draw(`Location: ${order.branchName}`, margin, 9, regular, muted)
-      y -= 14
-    }
-    draw(`Items: ${itemText(order.items)}`, margin, 9, regular, muted)
-    y -= 14
-    if (order.remark) {
-      draw(`Remark: ${order.remark}`, margin, 9, regular, muted)
-      y -= 14
-    }
-    draw(`Total: ${money(order.totalSen)}`, pageWidth - margin - 80, 10, bold)
-    y -= 12
-    page.drawLine({ start: { x: margin, y }, end: { x: pageWidth - margin, y }, thickness: 0.5, color: line })
-    y -= 16
-  }
-
-  addPageIfNeeded(20)
-  draw('Generated by Ordering System', margin, 9, regular, rgb(0.55, 0.58, 0.64))
   return document.save()
 }

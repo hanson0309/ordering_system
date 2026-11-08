@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { eq } from 'drizzle-orm'
-import { branches, categories, products, tenants } from '../../src/db/schema'
+import { branches, categories, products, regions, tenants } from '../../src/db/schema'
 import {
   db,
   createTenant,
@@ -9,6 +9,7 @@ import {
   createBranch,
   getPublic,
   postPublicOrder,
+  SELF,
 } from '../helpers'
 
 /**
@@ -18,6 +19,30 @@ import {
  * tenant's data.
  */
 describe('public storefront isolation', () => {
+  it('resolves a store only from its account, region, and store slug tuple', async () => {
+    const tenant = await createTenant('Tuple Store', 'tuple-store')
+    const mainRegionId = `region_default_${tenant}`
+    const pjRegionId = 'tuple-store-pj-region'
+    await db().insert(regions).values({ id: pjRegionId, tenantId: tenant, name: 'PJ', slug: 'pj' })
+    const firstStore = await createBranch(tenant, 'KK Main', 'kk', false, mainRegionId)
+    const secondStore = await createBranch(tenant, 'KK PJ', 'kk', false, pjRegionId)
+    const firstProduct = await createProduct(tenant, { name: 'Main menu' })
+    const secondProduct = await createProduct(tenant, { name: 'PJ menu' })
+    await db().update(products).set({ branchId: firstStore }).where(eq(products.id, firstProduct))
+    await db().update(products).set({ branchId: secondStore }).where(eq(products.id, secondProduct))
+
+    const response = await SELF.fetch('https://test.local/api/public/tuple-store/pj/kk/products')
+    expect(response.status).toBe(200)
+    expect((await response.json<{ products: { name: string }[] }>()).products.map(({ name }) => name)).toEqual(['PJ menu'])
+    expect((await SELF.fetch('https://test.local/api/public/tuple-store/unknown/kk/products')).status).toBe(404)
+    expect((await SELF.fetch('https://test.local/api/public/tuple-store/kk/products')).status).toBe(404)
+  })
+  it('does not serve the root or obsolete public API aliases', async () => {
+    await createTenant('Root Store', 'root-store')
+    expect((await SELF.fetch('https://test.local/api/public/products')).status).toBe(404)
+    expect((await SELF.fetch('https://test.local/api/public/root-store/default/products')).status).toBe(404)
+  })
+
   it('product listing for one tenant slug never includes another tenant\'s products', async () => {
     const ne = await createTenant('NE', 'ne-store-1')
     const upm = await createTenant('UPM', 'upm-store-1')
@@ -84,7 +109,7 @@ describe('public storefront isolation', () => {
 
   it('serves a location link from a one-time copied menu without mixing locations', async () => {
     const tenant = await createTenant('NE', 'ne-locations-1')
-    const defaultBranch = await createBranch(tenant, 'Default', 'default', true)
+    const defaultBranch = (await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1))[0].id
     const locationBranch = await createBranch(tenant, 'Bangi', 'bangi')
     const defaultCategory = await createCategory(tenant, 'Default category')
     await db().update(categories).set({ branchId: defaultBranch }).where(eq(categories.id, defaultCategory))
@@ -95,7 +120,7 @@ describe('public storefront isolation', () => {
     await db().insert(categories).values({ id: copiedCategory, tenantId: tenant, branchId: locationBranch, name: 'Bangi category', sortOrder: 0 })
     await db().insert(products).values({ id: copiedProduct, tenantId: tenant, branchId: locationBranch, categoryId: copiedCategory, name: 'Bangi menu', priceSen: 1200, isPublic: true, isAvailable: true })
 
-    const response = await getPublic('ne-locations-1/bangi', '/products')
+    const response = await getPublic('ne-locations-1/main/bangi', '/products')
     const body = await response.json<{ products: { name: string }[] }>()
     expect(response.status).toBe(200)
     expect(body.products.map((product) => product.name)).toEqual(['Bangi menu'])

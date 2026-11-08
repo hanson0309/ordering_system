@@ -2,7 +2,11 @@ import { describe, expect, it } from 'vitest'
 import { buildLocationLink } from './locationLink'
 
 describe('buildLocationLink', () => {
-  it('builds an absolute public link from the current origin', () => {
-    expect(buildLocationLink('upm', 'putrajaya', 'https://dashboard.example')).toBe('https://dashboard.example/upm/putrajaya')
+  it('uses the account, region, and store slugs', () => {
+    expect(buildLocationLink('upmstore', 'pj', 'kk', 'https://dashboard.example')).toBe('https://dashboard.example/upmstore/menu/pj/kk')
+  })
+
+  it('distinguishes the same store slug in separate regions', () => {
+    expect(buildLocationLink('upmstore', 'kk', 'kk', 'https://dashboard.example')).not.toBe(buildLocationLink('upmstore', 'pj', 'kk', 'https://dashboard.example'))
   })
 })

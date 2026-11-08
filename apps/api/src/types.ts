@@ -2,6 +2,7 @@ export interface Env {
   DB: D1Database
   DOCS_BUCKET: R2Bucket
   ENVIRONMENT: string
+  PUBLIC_TENANT_SLUG?: string
   TELEGRAM_SETTINGS_ENCRYPTION_KEY?: string
 }
 
@@ -29,6 +30,9 @@ export interface PublicBranchContext {
   id: string
   slug: string
   name: string
+  regionSlug: string
+  regionId: string
+  deliveryPeriod: 'lunch' | 'dinner' | null
 }
 
 // Hono variable map used across the dashboard/admin route groups.

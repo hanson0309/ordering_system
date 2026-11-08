@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { eq } from 'drizzle-orm'
-import { accountTelegramSettings, auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, productImages, products, tenantSettings, users } from '../src/db/schema'
+import { accountTelegramSettings, auditLogs, branches, categories, customers, notificationJobs, orderItems, orders, pricingRules, productImages, products, regions, scheduledMealPrices, tenantSettings, users } from '../src/db/schema'
 import { newId } from '../src/lib/id'
 import { processDueNotifications } from '../src/services/notifications'
 import { getAnalyticsRange, getMalaysiaDayStart } from '../src/routes/dashboard'
@@ -8,8 +8,10 @@ import type { Env } from '../src/types'
 import {
   SELF,
   addMembership,
+  createBranch,
   createCategory,
   createCustomer,
+  createRegion,
   createProduct,
   createTenant,
   createUser,
@@ -69,7 +71,7 @@ describe('tenant dashboard', () => {
     })
   })
 
-  it('lets an owner create an independent store with its own public link and design', async () => {
+  it('does not allow creating a store directly from an account', async () => {
     const originalTenant = await createTenant('Original', 'stores-original')
     const user = await createUser('dashboard-create-store@example.com')
     await addMembership(user, originalTenant, 'owner')
@@ -80,21 +82,14 @@ describe('tenant dashboard', () => {
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'UPM Cafe', slug: 'upm-cafe', design: 'midnight', tagline: 'Fresh every day' }),
     })
-    expect(response.status).toBe(201)
-    const body = await response.json<{ organization: { tenantId: string; slug: string; role: string } }>()
-    expect(body.organization.slug).toBe('upm-cafe')
-    expect(body.organization.role).toBe('owner')
-
-    const publicStore = await SELF.fetch('https://test.local/api/public/upm-cafe')
-    expect(publicStore.status).toBe(200)
-    await expect(publicStore.json()).resolves.toMatchObject({ name: 'UPM Cafe', slug: 'upm-cafe', businessInfo: { design: 'midnight', tagline: 'Fresh every day' } })
+    expect(response.status).toBe(404)
 
     const organizations = await SELF.fetch('https://test.local/api/me/organizations', { headers: { cookie } })
     const organizationBody = await organizations.json<{ organizations: { slug: string }[] }>()
-    expect(organizationBody.organizations.map((organization) => organization.slug)).toEqual(expect.arrayContaining(['stores-original', 'upm-cafe']))
+    expect(organizationBody.organizations.map((organization) => organization.slug)).toEqual(['stores-original'])
   })
 
-  it('does not let a non-owner create another store', async () => {
+  it('does not expose account-level store creation to a non-owner', async () => {
     const tenant = await createTenant('Staff Store', 'stores-staff')
     const user = await createUser('dashboard-create-store-staff@example.com')
     await addMembership(user, tenant, 'admin')
@@ -105,7 +100,25 @@ describe('tenant dashboard', () => {
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'Blocked', slug: 'stores-blocked', design: 'clean' }),
     })
-    expect(response.status).toBe(403)
+    expect(response.status).toBe(404)
+  })
+
+  it('only exposes a public store through its location link', async () => {
+    const tenant = await createTenant('Location Parent', 'location-parent')
+    await createBranch(tenant, 'Main location', 'main-location')
+
+    const accountStore = await SELF.fetch('https://test.local/api/public/location-parent')
+    const oldLocationStore = await SELF.fetch('https://test.local/api/public/location-parent/main-location')
+    const locationStore = await SELF.fetch('https://test.local/api/public/location-parent/main/main-location')
+
+    expect(accountStore.status).toBe(404)
+    expect(oldLocationStore.status).toBe(404)
+    expect(locationStore.status, await locationStore.clone().text()).toBe(200)
+    await expect(locationStore.json()).resolves.toMatchObject({
+      name: 'Location Parent',
+      slug: 'location-parent',
+      location: { slug: 'main-location', name: 'Main location' },
+    })
   })
 
   it('allows an owner to change the public store name and slug', async () => {
@@ -124,11 +137,11 @@ describe('tenant dashboard', () => {
     const settings = await SELF.fetch('https://test.local/api/dashboard/settings', { headers: { cookie } })
     await expect(settings.json()).resolves.toMatchObject({ settings: { orderListSendTime: '18:30' } })
 
-    const store = await SELF.fetch('https://test.local/api/public/upm-custom')
+    const store = await SELF.fetch('https://test.local/api/public/upm-custom/main/default')
     expect(store.status).toBe(200)
     await expect(store.json()).resolves.toMatchObject({ name: 'UPM', slug: 'upm-custom' })
 
-    const oldStore = await SELF.fetch('https://test.local/api/public/old-store-name')
+    const oldStore = await SELF.fetch('https://test.local/api/public/old-store-name/main/default')
     expect(oldStore.status).toBe(404)
   })
 
@@ -164,7 +177,7 @@ describe('tenant dashboard', () => {
     await env.DOCS_BUCKET.put(imageKey, 'product image')
     await db().insert(productImages).values({ id: newId('pimg'), tenantId: tenant, productId, r2Key: imageKey })
 
-    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}`, {
+    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}?branchId=${(await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1))[0].id}`, {
       method: 'DELETE',
       headers: { cookie },
     })
@@ -174,6 +187,28 @@ describe('tenant dashboard', () => {
     expect(await db().select().from(products).where(eq(products.id, productId))).toEqual([])
     expect(await db().select().from(productImages).where(eq(productImages.productId, productId))).toEqual([])
     expect(await env.DOCS_BUCKET.get(imageKey)).toBeNull()
+  })
+
+  it('deletes a scheduled product and its location price adjustments', async () => {
+    const tenant = await createTenant('Delete Scheduled Product', 'delete-scheduled-product')
+    const user = await createUser('delete-scheduled-product@example.com')
+    await addMembership(user, tenant, 'admin')
+    const cookie = await loginAndGetCookie('delete-scheduled-product@example.com')
+    const productId = await createProduct(tenant, { name: 'Remove scheduled meal', priceSen: 1000 })
+    const [branch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1)
+    const pricingRuleId = newId('price-rule')
+    await db().insert(pricingRules).values({ id: pricingRuleId, tenantId: tenant, name: 'Delivery' })
+    await db().insert(scheduledMealPrices).values({
+      id: newId('scheduled-price'), tenantId: tenant, productId, pricingRuleId, priceSen: 500,
+    })
+
+    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}?branchId=${branch.id}`, {
+      method: 'DELETE', headers: { cookie },
+    })
+
+    expect(response.status).toBe(200)
+    expect(await db().select().from(products).where(eq(products.id, productId))).toEqual([])
+    expect(await db().select().from(scheduledMealPrices).where(eq(scheduledMealPrices.productId, productId))).toEqual([])
   })
 
   it('does not delete another organization product', async () => {
@@ -201,7 +236,7 @@ describe('tenant dashboard', () => {
     const categoryId = await createCategory(tenant, 'Snacks')
     const productId = await createProduct(tenant, { name: 'Chips', categoryId })
 
-    const response = await SELF.fetch(`https://test.local/api/dashboard/categories/${categoryId}`, {
+    const response = await SELF.fetch(`https://test.local/api/dashboard/categories/${categoryId}?branchId=${(await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1))[0].id}`, {
       method: 'DELETE',
       headers: { cookie },
     })
@@ -354,7 +389,8 @@ describe('tenant dashboard', () => {
     await addMembership(user, ne, 'owner')
     const cookie = await loginAndGetCookie('dashboard-owner-1@example.com')
 
-    const ordersResponse = await SELF.fetch('https://test.local/api/dashboard/orders', { headers: { cookie } })
+    const [neBranch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, ne)).limit(1)
+    const ordersResponse = await SELF.fetch(`https://test.local/api/dashboard/orders?branchId=${neBranch.id}`, { headers: { cookie } })
     const ordersBody = await ordersResponse.json<{ orders: { customerName: string }[] }>()
     expect(ordersResponse.status).toBe(200)
     expect(ordersBody.orders.map((order) => order.customerName)).toEqual(['NE Customer'])
@@ -370,6 +406,38 @@ describe('tenant dashboard', () => {
     expect(forbiddenSwitch.res.status).toBe(403)
   })
 
+  it('lists organization orders from every region and store when no store is selected', async () => {
+    const tenant = await createTenant('Organization Orders', 'dashboard-organization-orders')
+    const otherTenant = await createTenant('Other Organization', 'dashboard-organization-orders-other')
+    const secondRegionId = await createRegion(tenant, 'North Region', 'north')
+    const secondBranchId = await createBranch(tenant, 'North Store', 'north-store', false, secondRegionId)
+    const [defaultBranch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1)
+    const [otherBranch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, otherTenant)).limit(1)
+    const defaultCustomer = await createCustomer(tenant, 'Default Store Customer')
+    const northCustomer = await createCustomer(tenant, 'North Store Customer')
+    const otherCustomer = await createCustomer(otherTenant, 'Other Store Customer')
+
+    await db().insert(orders).values([
+      { id: newId('order'), tenantId: tenant, branchId: defaultBranch.id, customerId: defaultCustomer, orderNumber: 'ORG-DEFAULT', totalSen: 1000, idempotencyKey: newId('idem') },
+      { id: newId('order'), tenantId: tenant, branchId: secondBranchId, customerId: northCustomer, orderNumber: 'ORG-NORTH', totalSen: 1200, idempotencyKey: newId('idem') },
+      { id: newId('order'), tenantId: otherTenant, branchId: otherBranch.id, customerId: otherCustomer, orderNumber: 'OTHER-ORDER', totalSen: 900, idempotencyKey: newId('idem') },
+    ])
+
+    const user = await createUser('dashboard-organization-orders@example.com')
+    await addMembership(user, tenant, 'staff')
+    const cookie = await loginAndGetCookie('dashboard-organization-orders@example.com')
+
+    const response = await SELF.fetch('https://test.local/api/dashboard/orders', { headers: { cookie } })
+    const body = await response.json<{ orders: { orderNumber: string; regionName: string | null; branchName: string | null }[]; pagination: { total: number } }>()
+
+    expect(response.status).toBe(200)
+    expect(body.pagination.total).toBe(2)
+    expect(body.orders).toEqual(expect.arrayContaining([
+      expect.objectContaining({ orderNumber: 'ORG-DEFAULT', regionName: 'Main Region', branchName: 'Default location' }),
+      expect.objectContaining({ orderNumber: 'ORG-NORTH', regionName: 'North Region', branchName: 'North Store' }),
+    ]))
+  })
+
   it('enforces role permissions and records an authorized status change', async () => {
     const tenant = await createTenant('NE', 'dashboard-role-1')
     const product = await createProduct(tenant, { priceSen: 2500 })
@@ -383,7 +451,8 @@ describe('tenant dashboard', () => {
     const viewer = await createUser('dashboard-viewer-1@example.com')
     await addMembership(viewer, tenant, 'viewer')
     const viewerCookie = await loginAndGetCookie('dashboard-viewer-1@example.com')
-    const viewerMutation = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/status`, {
+    const [branch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1)
+    const viewerMutation = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/status?branchId=${branch.id}`, {
       method: 'PATCH',
       headers: { cookie: viewerCookie, 'content-type': 'application/json' },
       body: JSON.stringify({ status: 'confirmed' }),
@@ -393,7 +462,7 @@ describe('tenant dashboard', () => {
     const owner = await createUser('dashboard-owner-2@example.com')
     await addMembership(owner, tenant, 'owner')
     const ownerCookie = await loginAndGetCookie('dashboard-owner-2@example.com')
-    const mutation = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/status`, {
+    const mutation = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/status?branchId=${branch.id}`, {
       method: 'PATCH',
       headers: { cookie: ownerCookie, 'content-type': 'application/json' },
       body: JSON.stringify({ status: 'confirmed' }),
@@ -439,7 +508,7 @@ describe('tenant dashboard', () => {
     await addMembership(user, tenant, 'admin')
     const cookie = await loginAndGetCookie('dashboard-edit-product@example.com')
 
-    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}`, {
+    const response = await SELF.fetch(`https://test.local/api/dashboard/products/${productId}?branchId=${(await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1))[0].id}`, {
       method: 'PATCH',
       headers: { cookie, 'content-type': 'application/json' },
       body: JSON.stringify({ name: 'New name', priceSen: 1250, imageUrl: null, isAvailable: false }),
@@ -454,7 +523,7 @@ describe('tenant dashboard', () => {
 
   it('creates a location with a one-time copy of the default menu', async () => {
     const tenant = await createTenant('NE', 'dashboard-location-copy')
-    const defaultBranch = await db().insert(branches).values({ id: 'branch-default-copy', tenantId: tenant, name: 'Default', slug: 'default', isDefault: true }).returning({ id: branches.id })
+    const defaultBranch = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1)
     const categoryId = 'cat-default-copy'
     await db().insert(categories).values({ id: categoryId, tenantId: tenant, branchId: defaultBranch[0].id, name: 'Drinks', sortOrder: 0 })
     await db().insert(products).values({ id: 'prod-default-copy', tenantId: tenant, branchId: defaultBranch[0].id, categoryId, name: 'Tea', priceSen: 500, isPublic: true, isAvailable: true })
@@ -465,7 +534,7 @@ describe('tenant dashboard', () => {
     const response = await SELF.fetch('https://test.local/api/dashboard/branches', {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'Bangi', slug: 'bangi', syncDefault: true, makeDefault: false }),
+      body: JSON.stringify({ name: 'Bangi', slug: 'bangi', regionId: `region_default_${tenant}`, syncDefault: true, makeDefault: false }),
     })
     expect(response.status).toBe(201)
     const body = await response.json<{ branch: { id: string } }>()
@@ -473,10 +542,65 @@ describe('tenant dashboard', () => {
     expect(copied.map((product) => product.name)).toEqual(['Tea'])
   })
 
+  it('creates tenant-owned regions and requires a valid region for each store', async () => {
+    const tenant = await createTenant('Region API', 'dashboard-region-api')
+    const otherTenant = await createTenant('Other Region API', 'dashboard-other-region-api')
+    const user = await createUser('dashboard-region-api@example.com')
+    await addMembership(user, tenant, 'admin')
+    const cookie = await loginAndGetCookie('dashboard-region-api@example.com')
+
+    const created = await SELF.fetch('https://test.local/api/dashboard/regions', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Petaling Jaya', slug: 'pj' }),
+    })
+    expect(created.status).toBe(201)
+    const { region } = await created.json<{ region: { id: string; tenantId: string; slug: string } }>()
+    expect(region).toMatchObject({ tenantId: tenant, slug: 'pj' })
+
+    const listed = await SELF.fetch('https://test.local/api/dashboard/regions', { headers: { cookie } })
+    expect((await listed.json<{ regions: { slug: string }[] }>()).regions.map(({ slug }) => slug)).toContain('pj')
+
+    const missingRegion = await SELF.fetch('https://test.local/api/dashboard/branches', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Missing Region', slug: 'missing-region' }),
+    })
+    expect(missingRegion.status).toBe(400)
+
+    const otherRegionId = `region_default_${otherTenant}`
+    const wrongTenantRegion = await SELF.fetch('https://test.local/api/dashboard/branches', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Wrong Region', slug: 'wrong-region', regionId: otherRegionId }),
+    })
+    expect(wrongTenantRegion.status).toBe(404)
+  })
+
+  it('allows a store slug to repeat across regions but not within one region', async () => {
+    const tenant = await createTenant('Repeated Store Slug', 'dashboard-region-slugs')
+    const user = await createUser('dashboard-region-slugs@example.com')
+    await addMembership(user, tenant, 'admin')
+    const cookie = await loginAndGetCookie('dashboard-region-slugs@example.com')
+    const firstRegionId = `region_default_${tenant}`
+    const secondRegionId = 'region-dashboard-second'
+    await db().insert(regions).values({ id: secondRegionId, tenantId: tenant, name: 'Second', slug: 'second' })
+
+    const createStore = (regionId: string, name: string) => SELF.fetch('https://test.local/api/dashboard/branches', {
+      method: 'POST',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ name, slug: 'kk', regionId }),
+    })
+    expect((await createStore(firstRegionId, 'First KK')).status).toBe(201)
+    expect((await createStore(secondRegionId, 'Second KK')).status).toBe(201)
+    expect((await createStore(firstRegionId, 'Duplicate KK')).status).toBe(409)
+  })
+
   it('keeps order detail actions inside the selected location', async () => {
     const tenant = await createTenant('NE', 'dashboard-location-order-isolation')
-    const [firstBranch] = await db().insert(branches).values({ id: 'branch-order-a', tenantId: tenant, name: 'A', slug: 'a', isDefault: true }).returning({ id: branches.id })
-    const [secondBranch] = await db().insert(branches).values({ id: 'branch-order-b', tenantId: tenant, name: 'B', slug: 'b', isDefault: false }).returning({ id: branches.id })
+    const defaultRegionId = `region_default_${tenant}`
+    const [firstBranch] = await db().insert(branches).values({ id: 'branch-order-a', tenantId: tenant, regionId: defaultRegionId, name: 'A', slug: 'a', isDefault: true }).returning({ id: branches.id })
+    const [secondBranch] = await db().insert(branches).values({ id: 'branch-order-b', tenantId: tenant, regionId: defaultRegionId, name: 'B', slug: 'b', isDefault: false }).returning({ id: branches.id })
     const customerId = await createCustomer(tenant, 'Location Customer')
     const orderId = newId('order')
     await db().insert(orders).values({
@@ -495,9 +619,9 @@ describe('tenant dashboard', () => {
       idempotencyKey: newId('notify'),
     })
 
-    const user = await createUser('dashboard-location-order-isolation@example.com')
+    const user = await createUser('location-order-isolation@example.com')
     await addMembership(user, tenant, 'staff')
-    const cookie = await loginAndGetCookie('dashboard-location-order-isolation@example.com')
+    const cookie = await loginAndGetCookie('location-order-isolation@example.com')
     const query = `?branchId=${firstBranch.id}`
 
     const detail = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}${query}`, { headers: { cookie } })
@@ -520,6 +644,62 @@ describe('tenant dashboard', () => {
     expect(retry.status).toBe(404)
   })
 
+  it('allows organization-wide order actions without a store query', async () => {
+    const tenant = await createTenant('Organization Order Actions', 'dashboard-organization-order-actions')
+    const secondRegionId = await createRegion(tenant, 'South Region', 'south')
+    const secondBranchId = await createBranch(tenant, 'South Store', 'south-store', false, secondRegionId)
+    const customerId = await createCustomer(tenant, 'Organization Action Customer')
+    const orderId = newId('order')
+    const receiptKey = `private/${tenant}/receipts/${orderId}.jpg`
+    await db().insert(orders).values({
+      id: orderId,
+      tenantId: tenant,
+      branchId: secondBranchId,
+      customerId,
+      orderNumber: 'ORG-ACTION-1',
+      totalSen: 1000,
+      idempotencyKey: newId('idem'),
+      paymentReceiptKey: receiptKey,
+      paymentReceiptContentType: 'image/jpeg',
+    })
+    await db().insert(notificationJobs).values({
+      id: newId('job'),
+      tenantId: tenant,
+      orderId,
+      idempotencyKey: newId('notify'),
+      status: 'failed',
+    })
+    await env.DOCS_BUCKET.put(receiptKey, 'receipt')
+
+    const user = await createUser('organization-order-actions@example.com')
+    await addMembership(user, tenant, 'staff')
+    const cookie = await loginAndGetCookie('organization-order-actions@example.com')
+
+    const detail = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}`, { headers: { cookie } })
+    expect(detail.status).toBe(200)
+
+    const receipt = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/payment-receipt`, { headers: { cookie } })
+    expect(receipt.status).toBe(200)
+    expect(receipt.headers.get('content-type')).toContain('image/jpeg')
+    expect(new TextDecoder().decode(await receipt.arrayBuffer())).toBe('receipt')
+
+    const pdf = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/pdf`, { headers: { cookie } })
+    expect(pdf.status).toBe(200)
+
+    const status = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/status`, {
+      method: 'PATCH',
+      headers: { cookie, 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'confirmed' }),
+    })
+    expect(status.status).toBe(200)
+
+    const retry = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/notification/retry`, {
+      method: 'POST',
+      headers: { cookie },
+    })
+    expect(retry.status).toBe(200)
+  })
+
   it('generates a private PDF only for an authorized tenant order', async () => {
     const ne = await createTenant('NE', 'dashboard-pdf-ne')
     const upm = await createTenant('UPM', 'dashboard-pdf-upm')
@@ -534,7 +714,8 @@ describe('tenant dashboard', () => {
     const owner = await createUser('dashboard-pdf-owner@example.com')
     await addMembership(owner, ne, 'staff')
     const cookie = await loginAndGetCookie('dashboard-pdf-owner@example.com')
-    const pdfResponse = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/pdf`, { headers: { cookie } })
+    const [branch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, ne)).limit(1)
+    const pdfResponse = await SELF.fetch(`https://test.local/api/dashboard/orders/${orderId}/pdf?branchId=${branch.id}`, { headers: { cookie } })
     const pdf = new Uint8Array(await pdfResponse.arrayBuffer())
     expect(pdfResponse.status).toBe(200)
     expect(pdfResponse.headers.get('content-type')).toContain('application/pdf')
@@ -689,5 +870,28 @@ describe('tenant dashboard', () => {
       if (previousChatId === undefined) delete testEnv.TELEGRAM_CHAT_ID
       else testEnv.TELEGRAM_CHAT_ID = previousChatId
     }
+  })
+
+  it('exposes the notification error category in the order list', async () => {
+    const tenant = await createTenant('Dashboard Notification Error', 'dashboard-notification-error')
+    const product = await createProduct(tenant, { priceSen: 500 })
+    const created = await postPublicOrder('dashboard-notification-error', {
+      idempotencyKey: 'dashboard-notification-error-order',
+      customer: { name: 'Notification Error Customer', phone: '0161111111' },
+      items: [{ productId: product, quantity: 1 }],
+    })
+    const { orderId } = await created.json<{ orderId: string }>()
+    await db().update(notificationJobs).set({ errorCategory: 'telegram_not_configured' }).where(eq(notificationJobs.orderId, orderId))
+
+    const user = await createUser('dashboard-notification-error@example.com')
+    await addMembership(user, tenant, 'staff')
+    const cookie = await loginAndGetCookie('dashboard-notification-error@example.com')
+    const [branch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1)
+    const response = await SELF.fetch(`https://test.local/api/dashboard/orders?branchId=${branch.id}`, { headers: { cookie } })
+
+    expect(response.status).toBe(200)
+    await expect(response.json()).resolves.toMatchObject({
+      orders: [expect.objectContaining({ notificationStatus: 'pending', notificationError: 'telegram_not_configured' })],
+    })
   })
 })

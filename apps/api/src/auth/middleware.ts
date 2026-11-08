@@ -2,7 +2,7 @@ import { createMiddleware } from 'hono/factory'
 import { getCookie } from 'hono/cookie'
 import { eq, and } from 'drizzle-orm'
 import { createDb } from '../db/client'
-import { branches, sessions, users, memberships, tenants } from '../db/schema'
+import { branches, regions, sessions, users, memberships, tenants } from '../db/schema'
 import { hashSessionToken, SESSION_COOKIE_NAME } from './session'
 import type { Env, AppVariables } from '../types'
 
@@ -129,13 +129,13 @@ export const requirePlatformAdmin = createMiddleware<{ Bindings: Env; Variables:
  */
 export const resolvePublicTenant = createMiddleware<{ Bindings: Env; Variables: AppVariables }>(
   async (c, next) => {
-    const slug = c.req.param('slug')
-    if (!slug) {
-      return c.json({ error: 'not_found' }, 404)
-    }
     const db = createDb(c.env)
+    const tenantSlug = c.req.param('tenantSlug')
+    const regionSlug = c.req.param('regionSlug')
+    const storeSlug = c.req.param('storeSlug')
+    if (!tenantSlug || !regionSlug || !storeSlug) return c.json({ error: 'not_found' }, 404)
 
-    const [tenant] = await db.select().from(tenants).where(eq(tenants.slug, slug)).limit(1)
+    const [tenant] = await db.select().from(tenants).where(eq(tenants.slug, tenantSlug)).limit(1)
 
     if (!tenant || tenant.status !== 'active') {
       return c.json({ error: 'not_found' }, 404)
@@ -143,19 +143,15 @@ export const resolvePublicTenant = createMiddleware<{ Bindings: Env; Variables: 
 
     c.set('publicTenant', { id: tenant.id, slug: tenant.slug, name: tenant.name })
 
-    const locationSlug = c.req.param('locationSlug')
-    const branchRows = await db
-      .select({ id: branches.id, slug: branches.slug, name: branches.name, isDefault: branches.isDefault })
+    const [region] = await db.select({ id: regions.id, slug: regions.slug }).from(regions)
+      .where(and(eq(regions.tenantId, tenant.id), eq(regions.slug, regionSlug))).limit(1)
+    if (!region) return c.json({ error: 'not_found' }, 404)
+    const [branch] = await db.select({ id: branches.id, slug: branches.slug, name: branches.name, deliveryPeriod: branches.deliveryPeriod })
       .from(branches)
-      .where(eq(branches.tenantId, tenant.id))
-    if (locationSlug) {
-      const branch = branchRows.find((row) => row.slug === locationSlug)
-      if (!branch || !branch.slug) return c.json({ error: 'not_found' }, 404)
-      c.set('publicBranch', { id: branch.id, slug: branch.slug, name: branch.name })
-    } else {
-      const defaultBranch = branchRows.find((row) => row.isDefault && row.slug)
-      c.set('publicBranch', defaultBranch?.slug ? { id: defaultBranch.id, slug: defaultBranch.slug, name: defaultBranch.name } : null)
-    }
+      .where(and(eq(branches.regionId, region.id), eq(branches.slug, storeSlug)))
+      .limit(1)
+    if (!branch || !branch.slug) return c.json({ error: 'not_found' }, 404)
+    c.set('publicBranch', { id: branch.id, slug: branch.slug, name: branch.name, regionSlug: region.slug, regionId: region.id, deliveryPeriod: branch.deliveryPeriod })
 
     await next()
   },

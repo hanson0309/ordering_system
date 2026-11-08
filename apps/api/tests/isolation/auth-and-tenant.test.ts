@@ -111,7 +111,7 @@ describe('tenant isolation', () => {
     const firstRes = await SELF.fetch('https://test.local/api/dashboard/users', {
       method: 'POST',
       headers: { cookie: adminCookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'first-account@example.com', password: 'password123', role: 'admin' }),
+      body: JSON.stringify({ username: 'first-account', password: 'password123', role: 'admin' }),
     })
     expect(firstRes.status).toBe(201)
     const first = await firstRes.json<{ membership: { tenantId: string } }>()
@@ -119,7 +119,7 @@ describe('tenant isolation', () => {
     const secondRes = await SELF.fetch('https://test.local/api/dashboard/users', {
       method: 'POST',
       headers: { cookie: adminCookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'second-account@example.com', password: 'password123', role: 'staff' }),
+      body: JSON.stringify({ username: 'second-account', password: 'password123', role: 'staff' }),
     })
     expect(secondRes.status).toBe(201)
     const second = await secondRes.json<{ membership: { tenantId: string } }>()

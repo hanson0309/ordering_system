@@ -13,6 +13,15 @@ const RECEIPT_TYPES = new Map([
 
 export type UploadValidation = { contentType: string; extension: string; bytes: ArrayBuffer }
 
+export function isUploadFile(value: unknown): value is File {
+  return Boolean(
+    value &&
+      typeof value === 'object' &&
+      typeof (value as { type?: unknown }).type === 'string' &&
+      typeof (value as { arrayBuffer?: unknown }).arrayBuffer === 'function',
+  )
+}
+
 export async function validateUpload(file: File, allowed: 'qr' | 'receipt'): Promise<UploadValidation | 'too_large' | null> {
   const extension = (allowed === 'qr' ? QR_TYPES : RECEIPT_TYPES).get(file.type)
   if (!extension) return null

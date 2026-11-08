@@ -4,6 +4,20 @@ import { db, createTenant, createUser, addMembership, grantPlatformAdmin, loginA
 import { memberships } from '../src/db/schema'
 
 describe('dashboard user management', () => {
+  it('logs in with a normalized username', async () => {
+    const tenant = await createTenant('Username login', 'username-login')
+    const userId = await createUser('store_admin@example.com')
+    await addMembership(userId, tenant, 'admin')
+
+    const response = await SELF.fetch('https://test.local/api/auth/login', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ username: ' Store_Admin ', password: 'password123' }),
+    })
+
+    expect(response.status).toBe(200)
+  })
+
   it('lets a platform administrator provision an account with a separate tenant', async () => {
     const tenant = await createTenant('Primary Store', 'user-management-primary')
     const administrator = await createUser('user-management-platform-admin@example.com')
@@ -14,12 +28,13 @@ describe('dashboard user management', () => {
     const response = await SELF.fetch('https://test.local/api/dashboard/users', {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'new-staff@example.com', password: 'new-password-123', role: 'staff' }),
+      body: JSON.stringify({ username: 'new-staff', password: 'new-password-123', role: 'staff' }),
     })
 
     expect(response.status).toBe(201)
-    const body = await response.json<{ user: { email: string; role: string }; membership: { tenantId: string }; organization: { tenantId: string } }>()
-    expect(body.user).toMatchObject({ email: 'new-staff@example.com', role: 'staff' })
+    const body = await response.json<{ user: { username: string; role: string }; membership: { tenantId: string }; organization: { tenantId: string } }>()
+    expect(body.user).toMatchObject({ username: 'new-staff', role: 'staff' })
+    expect(body.user).not.toHaveProperty('email')
     expect(body.membership.tenantId).toBe(body.organization.tenantId)
     expect(body.membership.tenantId).not.toBe(tenant)
     const accountMemberships = await db().select().from(memberships).where(eq(memberships.userId, body.user.id))
@@ -39,14 +54,14 @@ describe('dashboard user management', () => {
     const response = await SELF.fetch('https://test.local/api/dashboard/users', {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'blocked@example.com', password: 'new-password-123', role: 'staff' }),
+      body: JSON.stringify({ username: 'blocked-user', password: 'new-password-123', role: 'staff' }),
     })
 
     expect(response.status).toBe(403)
     await expect(response.json()).resolves.toEqual({ error: 'forbidden' })
   })
 
-  it('rejects duplicate emails and invalid account input', async () => {
+  it('rejects duplicate usernames and invalid account input', async () => {
     const tenant = await createTenant('User Store', 'user-management-validation')
     const administrator = await createUser('user-management-validation@example.com')
     await grantPlatformAdmin(administrator)
@@ -57,15 +72,15 @@ describe('dashboard user management', () => {
     const duplicate = await SELF.fetch('https://test.local/api/dashboard/users', {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'existing@example.com', password: 'new-password-123', role: 'staff' }),
+      body: JSON.stringify({ username: 'EXISTING', password: 'new-password-123', role: 'staff' }),
     })
     expect(duplicate.status).toBe(409)
-    await expect(duplicate.json()).resolves.toEqual({ error: 'email_taken' })
+    await expect(duplicate.json()).resolves.toEqual({ error: 'username_taken' })
 
     const invalid = await SELF.fetch('https://test.local/api/dashboard/users', {
       method: 'POST',
       headers: { cookie, 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'not-an-email', password: 'short', role: 'owner' }),
+      body: JSON.stringify({ username: 'not valid!', password: 'short', role: 'owner' }),
     })
     expect(invalid.status).toBe(400)
     await expect(invalid.json()).resolves.toEqual({ error: 'invalid_input' })
@@ -85,12 +100,13 @@ describe('dashboard user management', () => {
 
     const response = await SELF.fetch('https://test.local/api/dashboard/users', { headers: { cookie } })
     expect(response.status).toBe(200)
-    const body = await response.json<{ users: { email: string; role: string }[] }>()
+    const body = await response.json<{ users: { username: string; role: string }[] }>()
     expect(body.users).toEqual(expect.arrayContaining([
-      expect.objectContaining({ email: 'first-account@example.com', role: 'staff', tenantId: tenant }),
-      expect.objectContaining({ email: 'second-account@example.com', role: 'staff', tenantId: otherTenant }),
+      expect.objectContaining({ username: 'first-account', role: 'staff', tenantId: tenant }),
+      expect.objectContaining({ username: 'second-account', role: 'staff', tenantId: otherTenant }),
     ]))
-    expect(body.users.some((user) => user.email === 'user-management-list-admin@example.com')).toBe(false)
+    expect(body.users.some((user) => user.username === 'user-management-list-admin')).toBe(false)
+    expect(body.users.every((user) => !('email' in user))).toBe(true)
   })
 
   it('lets a platform administrator change an ordinary account role and reset its password', async () => {
@@ -116,7 +132,7 @@ describe('dashboard user management', () => {
     const oldLogin = await SELF.fetch('https://test.local/api/auth/login', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ email: 'user-management-edit-member@example.com', password: 'old-password-123' }),
+      body: JSON.stringify({ username: 'user-management-edit-member', password: 'old-password-123' }),
     })
     expect(oldLogin.status).toBe(401)
     const newCookie = await loginAndGetCookie('user-management-edit-member@example.com', 'new-password-123')
@@ -157,10 +173,10 @@ describe('dashboard user management', () => {
     expect(forbidden.status).toBe(403)
     await expect(forbidden.json()).resolves.toEqual({ error: 'forbidden' })
 
-    const administrator = await createUser('user-management-edit-permissions-platform@example.com')
+    const administrator = await createUser('edit-permissions-platform@example.com')
     await grantPlatformAdmin(administrator)
     await addMembership(administrator, tenant, 'owner')
-    const administratorCookie = await loginAndGetCookie('user-management-edit-permissions-platform@example.com')
+    const administratorCookie = await loginAndGetCookie('edit-permissions-platform@example.com')
     const invalidRole = await SELF.fetch(`https://test.local/api/dashboard/users/${member}`, {
       method: 'PATCH',
       headers: { cookie: administratorCookie, 'content-type': 'application/json' },

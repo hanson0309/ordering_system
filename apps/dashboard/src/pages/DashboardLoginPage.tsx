@@ -5,7 +5,7 @@ import { LanguageToggle, useLanguage } from '../lib/i18n'
 
 export default function DashboardLoginPage() {
   const navigate = useNavigate()
-  const [email, setEmail] = useState('')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -16,7 +16,7 @@ export default function DashboardLoginPage() {
     setSubmitting(true)
     setError(null)
     try {
-      await login(email, password)
+      await login(username, password)
       const organizations = await getOrganizations()
       if (organizations.organizations.length === 0) {
         setError(t('Login succeeded, but this account has no organization access.'))
@@ -24,7 +24,7 @@ export default function DashboardLoginPage() {
       }
       navigate('/dashboard')
     } catch (err) {
-      setError(err instanceof ApiError && err.status === 401 ? t('Email or password is incorrect.') : t('Unable to log in right now. Please try again later.'))
+      setError(err instanceof ApiError && err.status === 401 ? t('Username or password is incorrect.') : t('Unable to log in right now. Please try again later.'))
     } finally {
       setSubmitting(false)
     }
@@ -43,14 +43,13 @@ export default function DashboardLoginPage() {
 
           <div className="space-y-4">
             <div>
-              <label htmlFor="dashboard-email" className="mb-1.5 block text-sm font-medium text-slate-700">{t('Email')}</label>
+              <label htmlFor="dashboard-username" className="mb-1.5 block text-sm font-medium text-slate-700">{t('Username')}</label>
               <input
-                id="dashboard-email"
-                type="email"
-                autoComplete="email"
+                id="dashboard-username"
+                autoComplete="username"
                 required
-                value={email}
-                onChange={(event) => setEmail(event.target.value)}
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
                 className="w-full rounded-lg border border-slate-300 px-3 py-2.5 outline-none transition focus:border-amber-500 focus:ring-2 focus:ring-amber-100"
               />
             </div>
