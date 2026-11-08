@@ -176,6 +176,10 @@ export function formatOrderListAddOns(order: Pick<OrderListPdfRow, 'items' | 're
   return products.join('; ') || '-'
 }
 
+export function orderRemarkSeparatorY(nextHeadingBaseline: number): number {
+  return nextHeadingBaseline + 12
+}
+
 export async function renderOrderListPdf(data: { organizationName: string; businessDate: string; orders: OrderListPdfRow[] }, options: PdfRenderOptions = {}): Promise<Uint8Array> {
   const document = await PDFDocument.create()
   const { regular, bold } = await createFonts(document, options.fontBytes)
@@ -345,7 +349,8 @@ export async function renderOrderListPdf(data: { organizationName: string; busin
         cursorY -= 12
       }
       cursorY -= 8
-      page!.drawLine({ start: { x: margin, y: cursorY + 3 }, end: { x: pageWidth - margin, y: cursorY + 3 }, thickness: 0.4, color: gridLine })
+      const separatorY = orderRemarkSeparatorY(cursorY)
+      page!.drawLine({ start: { x: margin, y: separatorY }, end: { x: pageWidth - margin, y: separatorY }, thickness: 0.4, color: gridLine })
     }
   }
 

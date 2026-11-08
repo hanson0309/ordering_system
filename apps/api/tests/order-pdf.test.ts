@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { PDFDocument } from 'pdf-lib'
-import { formatMalaysiaDateTime, formatOrderListAddOns, groupOrderListRows, pdfText, renderOrderListPdf } from '../src/services/order-pdf'
+import { formatMalaysiaDateTime, formatOrderListAddOns, groupOrderListRows, orderRemarkSeparatorY, pdfText, renderOrderListPdf } from '../src/services/order-pdf'
 
 describe('order PDF formatting', () => {
   it('keeps Chinese text instead of replacing it with question marks', () => {
@@ -38,6 +38,10 @@ describe('order PDF formatting', () => {
       items: [{ productNameSnapshot: 'Nasi Lemak', quantity: 2 }],
       remark: 'Less spicy',
     } as any)).toBe('Nasi Lemak x2; Remark: Less spicy')
+  })
+
+  it('places remark separators above the next heading with a clear gap', () => {
+    expect(orderRemarkSeparatorY(300)).toBe(312)
   })
 
   it('creates an A4 landscape order-list page', async () => {
