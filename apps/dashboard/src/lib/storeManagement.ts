@@ -21,3 +21,15 @@ export function groupStoresByRegion(
     isActive: region.id === activeRegionId,
   }))
 }
+
+export function groupStoresForActiveRegion(
+  regions: DashboardRegion[],
+  branches: DashboardBranch[],
+  activeRegionId: string | null,
+) {
+  return groupStoresByRegion(
+    regions.filter((region) => !activeRegionId || region.id === activeRegionId),
+    branches,
+    activeRegionId,
+  )
+}

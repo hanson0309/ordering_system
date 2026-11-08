@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildStoreCreationInput, groupStoresByRegion } from './storeManagement'
+import { buildStoreCreationInput, groupStoresByRegion, groupStoresForActiveRegion } from './storeManagement'
 
 describe('groupStoresByRegion', () => {
   it('keeps stores under their own region and marks only the selected region active', () => {
@@ -14,6 +14,23 @@ describe('groupStoresByRegion', () => {
 
     expect(groupStoresByRegion(regions, branches, 'region-b')).toEqual([
       { region: regions[0], stores: [branches[0]], isActive: false },
+      { region: regions[1], stores: [branches[1]], isActive: true },
+    ])
+  })
+})
+
+describe('groupStoresForActiveRegion', () => {
+  it('returns only stores from the selected region', () => {
+    const regions = [
+      { id: 'region-a', tenantId: 'tenant', name: 'Region A', slug: 'a', isDefault: true },
+      { id: 'region-b', tenantId: 'tenant', name: 'Region B', slug: 'b', isDefault: false },
+    ]
+    const branches = [
+      { id: 'store-a', regionId: 'region-a', name: 'Store A', slug: 'store-a', address: null, isDefault: true, hasPaymentQr: false },
+      { id: 'store-b', regionId: 'region-b', name: 'Store B', slug: 'store-b', address: null, isDefault: false, hasPaymentQr: false },
+    ]
+
+    expect(groupStoresForActiveRegion(regions, branches, 'region-b')).toEqual([
       { region: regions[1], stores: [branches[1]], isActive: true },
     ])
   })

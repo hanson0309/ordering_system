@@ -438,6 +438,35 @@ describe('tenant dashboard', () => {
     ]))
   })
 
+  it('scopes dashboard orders and analytics to the selected region', async () => {
+    const tenant = await createTenant('Region Scope', 'dashboard-region-scope')
+    const northRegionId = await createRegion(tenant, 'North', 'north')
+    const northBranchId = await createBranch(tenant, 'North Store', 'north-store', false, northRegionId)
+    const [mainBranch] = await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, tenant)).limit(1)
+    const mainCustomer = await createCustomer(tenant, 'Main Region Customer')
+    const northCustomer = await createCustomer(tenant, 'North Region Customer')
+
+    await db().insert(orders).values([
+      { id: newId('order'), tenantId: tenant, branchId: mainBranch.id, customerId: mainCustomer, orderNumber: 'REGION-MAIN', totalSen: 1000, idempotencyKey: newId('idem'), createdAt: new Date(Date.now() - 60 * 60 * 1000) },
+      { id: newId('order'), tenantId: tenant, branchId: northBranchId, customerId: northCustomer, orderNumber: 'REGION-NORTH', totalSen: 2500, idempotencyKey: newId('idem'), createdAt: new Date(Date.now() - 60 * 60 * 1000) },
+    ])
+
+    const user = await createUser('dashboard-region-scope@example.com')
+    await addMembership(user, tenant, 'staff')
+    const cookie = await loginAndGetCookie('dashboard-region-scope@example.com')
+    const ordersResponse = await SELF.fetch(`https://test.local/api/dashboard/orders?regionId=${northRegionId}`, { headers: { cookie } })
+    const ordersBody = await ordersResponse.json<{ orders: { orderNumber: string }[]; pagination: { total: number } }>()
+    const summaryResponse = await SELF.fetch(`https://test.local/api/dashboard/summary?regionId=${northRegionId}&period=month`, { headers: { cookie } })
+    const summaryBody = await summaryResponse.json<{ orderCount: number; totalSen: number }>()
+
+    expect(ordersResponse.status).toBe(200)
+    expect(ordersBody.pagination.total).toBe(1)
+    expect(ordersBody.orders.map((order) => order.orderNumber)).toEqual(['REGION-NORTH'])
+    expect(summaryResponse.status).toBe(200)
+    expect(summaryBody.orderCount).toBe(1)
+    expect(summaryBody.totalSen).toBe(2500)
+  })
+
   it('enforces role permissions and records an authorized status change', async () => {
     const tenant = await createTenant('NE', 'dashboard-role-1')
     const product = await createProduct(tenant, { priceSen: 2500 })
@@ -773,12 +802,23 @@ describe('tenant dashboard', () => {
     const user = await createUser('manual-digest-admin@example.com')
     const tenant = await createTenant('Manual Digest Store', 'manual-digest-store', user)
     const product = await createProduct(tenant, { priceSen: 1250 })
+    const mainRegionId = `region_default_${tenant}`
+    const northRegionId = await createRegion(tenant, 'North', 'north')
+    const northBranchId = await createBranch(tenant, 'North Store', 'north-store', false, northRegionId)
+    const northProduct = await createProduct(tenant, { name: 'North product', priceSen: 900 })
+    await db().update(products).set({ branchId: northBranchId }).where(eq(products.id, northProduct))
     const created = await postPublicOrder('manual-digest-store', {
       idempotencyKey: 'manual-digest-order',
       customer: { name: 'Manual Customer', phone: '0167777777' },
       items: [{ productId: product, quantity: 2 }],
     })
     const { orderId } = await created.json<{ orderId: string }>()
+    const northCreated = await postPublicOrder('manual-digest-store/north/north-store', {
+      idempotencyKey: 'manual-digest-north-order',
+      customer: { name: 'North Customer', phone: '0167777778' },
+      items: [{ productId: northProduct, quantity: 1 }],
+    })
+    const { orderId: northOrderId } = await northCreated.json<{ orderId: string }>()
     await db().insert(tenantSettings).values({ tenantId: tenant, orderListSendTime: '23:00', orderListLastSentDate: '2099-01-01' })
     await addMembership(user, tenant, 'admin')
     const cookie = await loginAndGetCookie('manual-digest-admin@example.com')
@@ -793,20 +833,22 @@ describe('tenant dashboard', () => {
     expect(save.status).toBe(200)
     const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({ ok: true }), { status: 200 }))
 
-    const response = await SELF.fetch('https://test.local/api/dashboard/orders/order-list/send-now', { method: 'POST', headers: { cookie } })
+    const response = await SELF.fetch(`https://test.local/api/dashboard/orders/order-list/send-now?regionId=${mainRegionId}`, { method: 'POST', headers: { cookie } })
     expect(response.status).toBe(200)
     await expect(response.json()).resolves.toMatchObject({ sent: true, orderCount: 1 })
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     const sentFile = (fetchSpy.mock.calls[0]?.[1] as RequestInit).body as FormData
     expect((sentFile.get('document') as File).name).toMatch(/^order-list-.+\.pdf$/)
     const [job] = await db().select().from(notificationJobs).where(eq(notificationJobs.orderId, orderId)).limit(1)
+    const [northJob] = await db().select().from(notificationJobs).where(eq(notificationJobs.orderId, northOrderId)).limit(1)
     const [order] = await db().select().from(orders).where(eq(orders.id, orderId)).limit(1)
     const [settings] = await db().select().from(tenantSettings).where(eq(tenantSettings.tenantId, tenant)).limit(1)
     expect(job.status).toBe('sent')
+    expect(northJob.status).toBe('pending')
     expect(order.status).toBe('pending')
     expect(settings.orderListLastSentDate).toBe('2099-01-01')
 
-    const empty = await SELF.fetch('https://test.local/api/dashboard/orders/order-list/send-now', { method: 'POST', headers: { cookie } })
+    const empty = await SELF.fetch(`https://test.local/api/dashboard/orders/order-list/send-now?regionId=${mainRegionId}`, { method: 'POST', headers: { cookie } })
     expect(empty.status).toBe(409)
     expect(fetchSpy).toHaveBeenCalledTimes(1)
     fetchSpy.mockRestore()

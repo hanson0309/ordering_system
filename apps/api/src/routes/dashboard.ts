@@ -393,6 +393,18 @@ async function resolveBranch(c: DashboardContext): Promise<{ id: string; tenantI
   return branch ?? false
 }
 
+async function resolveRegion(c: DashboardContext): Promise<{ id: string } | null | false> {
+  const regionId = c.req.query('regionId')
+  if (!regionId) return null
+  const tenantId = c.get('tenant').tenantId
+  const [region] = await createDb(c.env)
+    .select({ id: regions.id })
+    .from(regions)
+    .where(and(eq(regions.id, regionId), eq(regions.tenantId, tenantId)))
+    .limit(1)
+  return region ?? false
+}
+
 function branchPredicate<T extends { branchId: any }>(table: T, branchId: string | null) {
   return branchId ? eq(table.branchId, branchId) : isNull(table.branchId)
 }
@@ -432,14 +444,18 @@ export function getAnalyticsRange(period: AnalyticsPeriod, now = new Date()) {
 dashboardRoutes.get('/summary', async (c) => {
   const tenantId = c.get('tenant').tenantId
   const branch = await resolveBranch(c)
-  if (branch === false) return c.json({ error: 'not_found' }, 404)
+  const region = await resolveRegion(c)
+  if (branch === false || region === false) return c.json({ error: 'not_found' }, 404)
   const branchId = branch?.id ?? null
   const periodParam = c.req.query('period') ?? 'today'
   if (periodParam !== 'today' && periodParam !== 'week' && periodParam !== 'month') return c.json({ error: 'invalid_period' }, 400)
   const period = periodParam as AnalyticsPeriod
   const range = getAnalyticsRange(period)
   const db = createDb(c.env)
-  const rangePredicate = and(branchPredicate(orders, branchId), gte(orders.createdAt, range.start), lt(orders.createdAt, range.end))
+  const regionPredicate = region
+    ? inArray(orders.branchId, db.select({ id: branches.id }).from(branches).where(and(eq(branches.tenantId, tenantId), eq(branches.regionId, region.id))))
+    : undefined
+  const rangePredicate = and(optionalOrderBranchPredicate(orders, branchId), regionPredicate, gte(orders.createdAt, range.start), lt(orders.createdAt, range.end))
   const analyticsOrders = await db
     .select({ id: orders.id, createdAt: orders.createdAt, totalSen: orders.totalSen })
     .from(orders)
@@ -487,13 +503,17 @@ dashboardRoutes.get('/summary', async (c) => {
 dashboardRoutes.get('/orders', async (c) => {
   const tenantId = c.get('tenant').tenantId
   const branch = await resolveBranch(c)
-  if (branch === false) return c.json({ error: 'not_found' }, 404)
+  const region = await resolveRegion(c)
+  if (branch === false || region === false) return c.json({ error: 'not_found' }, 404)
   const branchId = branch?.id ?? null
   const status = parseOptionalStatus(c.req.query('status'))
   if (status === null) return c.json({ error: 'invalid_status' }, 400)
   const { limit, offset } = parsePagination(c)
   const db = createDb(c.env)
-  const predicate = scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), status ? eq(orders.status, status) : undefined))
+  const regionPredicate = region
+    ? inArray(orders.branchId, db.select({ id: branches.id }).from(branches).where(and(eq(branches.tenantId, tenantId), eq(branches.regionId, region.id))))
+    : undefined
+  const predicate = scoped(orders, tenantId, and(optionalOrderBranchPredicate(orders, branchId), regionPredicate, status ? eq(orders.status, status) : undefined))
 
   const rows = await db
     .select({
@@ -546,8 +566,10 @@ dashboardRoutes.get('/orders', async (c) => {
 
 dashboardRoutes.post('/orders/order-list/send-now', requireRole('admin'), async (c) => {
   const tenantId = c.get('tenant').tenantId
+  const region = await resolveRegion(c)
+  if (region === false) return c.json({ error: 'not_found' }, 404)
   try {
-    const orderCount = await sendOrderListNow(c.env, tenantId)
+    const orderCount = await sendOrderListNow(c.env, tenantId, region?.id)
     if (orderCount === null) return c.json({ error: 'not_found' }, 404)
     if (orderCount === 0) return c.json({ error: 'no_pending_orders' }, 409)
     return c.json({ sent: true, orderCount })

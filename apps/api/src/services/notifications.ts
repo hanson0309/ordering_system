@@ -75,10 +75,13 @@ function isDue(sendTime: string | null, currentTime: string) {
   return Boolean(sendTime && /^([01]\d|2[0-3]):[0-5]\d$/.test(sendTime) && sendTime <= currentTime)
 }
 
-async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string; accountUserId: string | null; organizationName: string; sendTime: string | null; lastSentDate: string | null }, now: Date, force = false) {
+async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string; accountUserId: string | null; organizationName: string; sendTime: string | null; lastSentDate: string | null }, now: Date, force = false, regionId?: string) {
   const parts = malaysiaDateParts(now)
   if (!force && (!isDue(setting.sendTime, parts.time) || setting.lastSentDate === parts.date)) return 0
-  const rows = await db.select({ id: orders.id, orderNumber: orders.orderNumber, createdAt: orders.createdAt, customerName: customers.name, customerPhone: customers.phone, remark: orders.remark, totalSen: orders.totalSen, regionName: regions.name, branchName: branches.name }).from(orders).innerJoin(customers, and(eq(customers.id, orders.customerId), eq(customers.tenantId, setting.tenantId))).leftJoin(branches, and(eq(branches.id, orders.branchId), eq(branches.tenantId, setting.tenantId))).leftJoin(regions, and(eq(regions.id, branches.regionId), eq(regions.tenantId, setting.tenantId))).innerJoin(notificationJobs, and(eq(notificationJobs.orderId, orders.id), eq(notificationJobs.tenantId, setting.tenantId))).where(and(eq(orders.tenantId, setting.tenantId), or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled')))).orderBy(asc(orders.createdAt))
+  const regionPredicate = regionId
+    ? inArray(orders.branchId, db.select({ id: branches.id }).from(branches).where(and(eq(branches.tenantId, setting.tenantId), eq(branches.regionId, regionId))))
+    : undefined
+  const rows = await db.select({ id: orders.id, orderNumber: orders.orderNumber, createdAt: orders.createdAt, customerName: customers.name, customerPhone: customers.phone, remark: orders.remark, totalSen: orders.totalSen, regionName: regions.name, branchName: branches.name }).from(orders).innerJoin(customers, and(eq(customers.id, orders.customerId), eq(customers.tenantId, setting.tenantId))).leftJoin(branches, and(eq(branches.id, orders.branchId), eq(branches.tenantId, setting.tenantId))).leftJoin(regions, and(eq(regions.id, branches.regionId), eq(regions.tenantId, setting.tenantId))).innerJoin(notificationJobs, and(eq(notificationJobs.orderId, orders.id), eq(notificationJobs.tenantId, setting.tenantId))).where(and(eq(orders.tenantId, setting.tenantId), regionPredicate, or(eq(notificationJobs.status, 'pending'), eq(notificationJobs.status, 'retry_scheduled')))).orderBy(asc(orders.createdAt))
   if (rows.length === 0) {
     if (!force) await db.update(tenantSettings).set({ orderListLastSentDate: parts.date, updatedAt: new Date() }).where(eq(tenantSettings.tenantId, setting.tenantId))
     return 0
@@ -103,7 +106,7 @@ async function sendTenantOrderList(env: Env, db: Db, setting: { tenantId: string
   return rows.length
 }
 
-export async function sendOrderListNow(env: Env, tenantId: string) {
+export async function sendOrderListNow(env: Env, tenantId: string, regionId?: string) {
   const db = createDb(env)
   const [[tenant], [settings]] = await Promise.all([
     db.select({ name: tenants.name, accountUserId: tenants.accountUserId }).from(tenants).where(eq(tenants.id, tenantId)).limit(1),
@@ -116,7 +119,7 @@ export async function sendOrderListNow(env: Env, tenantId: string) {
     organizationName: tenant.name,
     sendTime: settings?.orderListSendTime ?? null,
     lastSentDate: settings?.orderListLastSentDate ?? null,
-  }, new Date(), true)
+  }, new Date(), true, regionId)
   return orderCount
 }
 

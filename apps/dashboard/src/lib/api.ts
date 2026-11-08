@@ -287,26 +287,29 @@ export function deleteDashboardPaymentQr(branchId: string) {
   return request<{ branchId: string; paymentQrUrl: null }>(`/dashboard/branches/${branchId}/payment-qr`, { method: 'DELETE' })
 }
 
-export function getDashboardSummary(branchId?: string | null, period: DashboardAnalyticsPeriod = 'month') {
+export function getDashboardSummary(branchId?: string | null, period: DashboardAnalyticsPeriod = 'month', regionId?: string | null) {
   const query = new URLSearchParams({ period })
   if (branchId) query.set('branchId', branchId)
+  if (regionId) query.set('regionId', regionId)
   return request<DashboardSummary>(`/dashboard/summary?${query.toString()}`)
 }
 
-export function getDashboardOrders(params: { status?: string; limit?: number; offset?: number; branchId?: string | null } = {}) {
+export function getDashboardOrders(params: { status?: string; limit?: number; offset?: number; branchId?: string | null; regionId?: string | null } = {}) {
   const query = new URLSearchParams()
   if (params.status) query.set('status', params.status)
   if (params.limit !== undefined) query.set('limit', String(params.limit))
   if (params.offset !== undefined) query.set('offset', String(params.offset))
   if (params.branchId) query.set('branchId', params.branchId)
+  if (params.regionId) query.set('regionId', params.regionId)
   const suffix = query.toString() ? `?${query.toString()}` : ''
   return request<{ orders: DashboardOrder[]; pagination: { limit: number; offset: number; total: number } }>(
     `/dashboard/orders${suffix}`,
   )
 }
 
-export function sendDashboardOrderListNow() {
-  return request<{ sent: true; orderCount: number }>('/dashboard/orders/order-list/send-now', { method: 'POST' })
+export function sendDashboardOrderListNow(regionId?: string | null) {
+  const suffix = regionId ? `?regionId=${encodeURIComponent(regionId)}` : ''
+  return request<{ sent: true; orderCount: number }>(`/dashboard/orders/order-list/send-now${suffix}`, { method: 'POST' })
 }
 
 export function getDashboardPaymentReceipt(orderId: string, branchId?: string | null) {

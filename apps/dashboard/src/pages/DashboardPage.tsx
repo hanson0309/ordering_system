@@ -57,7 +57,7 @@ import { LanguageToggle, useLanguage } from '../lib/i18n'
 import { compressImage } from '../lib/image'
 import { buildLocationLink } from '../lib/locationLink'
 import { selectBranchId } from '../lib/branchSelection'
-import { buildStoreCreationInput, groupStoresByRegion } from '../lib/storeManagement'
+import { buildStoreCreationInput, groupStoresForActiveRegion } from '../lib/storeManagement'
 import { buildRulePrices, getRulePriceInputValue, validateScheduledMealDraft } from '../lib/pricingRules'
 import { formatMalaysiaTime, getProductKind, type ProductKind } from '../lib/productSchedule'
 
@@ -124,8 +124,8 @@ export default function DashboardPage() {
       const selectedBranchId = selectBranchId(branchRes.branches, activeBranchId, branchOverride)
       setActiveBranchId(selectedBranchId)
       const [summaryRes, ordersRes, productsRes, categoriesRes, settingsRes, usersRes, pricingRulesRes] = await Promise.all([
-        getDashboardSummary(selectedBranchId, analyticsPeriod),
-        getDashboardOrders({ limit: 50 }),
+        getDashboardSummary(null, analyticsPeriod, selectedRegionId),
+        getDashboardOrders({ limit: 50, regionId: selectedRegionId }),
         getDashboardProducts(selectedBranchId),
         getDashboardCategories(selectedBranchId),
         getDashboardSettings(),
@@ -158,7 +158,7 @@ export default function DashboardPage() {
     if (!activeOrganization || loading) return
     const refresh = window.setInterval(async () => {
       try {
-        const [summaryRes, ordersRes] = await Promise.all([getDashboardSummary(activeBranchId, analyticsPeriod), getDashboardOrders({ limit: 50 })])
+        const [summaryRes, ordersRes] = await Promise.all([getDashboardSummary(null, analyticsPeriod, activeRegionId), getDashboardOrders({ limit: 50, regionId: activeRegionId })])
         const previousIds = new Set(orders.map((order) => order.id))
         const newOrders = ordersRes.orders.filter((order) => !previousIds.has(order.id) && order.status === 'pending')
         if (newOrders.length > 0) setNewOrderCount((count) => count + newOrders.length)
@@ -169,14 +169,14 @@ export default function DashboardPage() {
       }
     }, 15000)
     return () => window.clearInterval(refresh)
-  }, [activeOrganization, activeBranchId, analyticsPeriod, loading, orders])
+  }, [activeOrganization, activeBranchId, activeRegionId, analyticsPeriod, loading, orders])
 
   async function handleAnalyticsPeriodChange(period: DashboardAnalyticsPeriod) {
     setAnalyticsPeriod(period)
     setAnalyticsLoading(true)
     setError(null)
     try {
-      setSummary(await getDashboardSummary(activeBranchId, period))
+      setSummary(await getDashboardSummary(null, period, activeRegionId))
     } catch {
       setError(t('Analytics data failed to load. Please try again.'))
     } finally {
@@ -217,7 +217,7 @@ export default function DashboardPage() {
     setError(null)
     setMessage(null)
     try {
-      const result = await sendDashboardOrderListNow()
+      const result = await sendDashboardOrderListNow(activeRegionId)
       setMessage(t('Order list sent successfully ({count} orders).', { count: result.orderCount }))
       await loadDashboard()
     } catch (err) {
@@ -297,7 +297,7 @@ function Overview({ summary, period, analyticsLoading, onPeriodChange, orders, o
 
 function Orders({ orders, canManage, sendingOrderList, onSendOrderListNow, onRetryNotification }: { orders: DashboardOrder[]; canManage: boolean; sendingOrderList: boolean; onSendOrderListNow: () => Promise<void>; onRetryNotification: (orderId: string) => Promise<void> }) {
   const { t } = useLanguage()
-  return <section className="rounded-xl border border-slate-200 bg-white"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-4"><div><h2 className="font-semibold">{t('Order list')}</h2><p className="mt-1 text-sm text-slate-500">{t('Only orders from the current organization are shown.')}</p></div>{canManage && <button type="button" onClick={() => void onSendOrderListNow()} disabled={sendingOrderList} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{sendingOrderList ? t('Sending order list...') : t('Summarize and send now')}</button>}</div><OrdersTable orders={orders} onRetryNotification={onRetryNotification} /></section>
+  return <section className="rounded-xl border border-slate-200 bg-white"><div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-4 py-4"><div><h2 className="font-semibold">{t('Order list')}</h2><p className="mt-1 text-sm text-slate-500">{t('Only orders from the selected region are shown.')}</p></div>{canManage && <button type="button" onClick={() => void onSendOrderListNow()} disabled={sendingOrderList} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{sendingOrderList ? t('Sending order list...') : t('Summarize and send now')}</button>}</div><OrdersTable orders={orders} onRetryNotification={onRetryNotification} /></section>
 }
 
 function OrdersTable({ orders, onRetryNotification }: { orders: DashboardOrder[]; onRetryNotification: (orderId: string) => Promise<void> }) {
@@ -366,7 +366,7 @@ function Stores({ tenantSlug, regions, activeRegionId, allBranches, pricingRules
     catch { setError('Location price rule could not be updated.') } finally { setSaving(false) }
   }
 
-  const regionViews = groupStoresByRegion(regions, allBranches, activeRegionId)
+  const regionViews = groupStoresForActiveRegion(regions, allBranches, activeRegionId)
   return <div className="space-y-6">
     <section className="max-w-3xl rounded-xl border border-slate-200 bg-white p-5">
       <h2 className="font-semibold">{t('Regions and stores')}</h2>
