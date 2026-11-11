@@ -5,6 +5,8 @@ import {
   createDashboardCategory,
   createDashboardBranch,
   createDashboardRegion,
+  renameDashboardRegion,
+  renameDashboardBranch,
   createDashboardProduct,
   getDashboardCategories,
   deleteDashboardCategory,
@@ -58,7 +60,7 @@ import { compressImage } from '../lib/image'
 import { buildLocationLink } from '../lib/locationLink'
 import { selectBranchId } from '../lib/branchSelection'
 import { buildStoreCreationInput, groupStoresForActiveRegion } from '../lib/storeManagement'
-import { buildRulePrices, getRulePriceInputValue, validateScheduledMealDraft } from '../lib/pricingRules'
+import { validateScheduledMealDraft } from '../lib/pricingRules'
 import { formatMalaysiaTime, getProductKind, type ProductKind } from '../lib/productSchedule'
 
 type Tab = 'overview' | 'orders' | 'catalog' | 'stores' | 'settings' | 'users'
@@ -314,10 +316,17 @@ function Stores({ tenantSlug, regions, activeRegionId, allBranches, pricingRules
   const [branchDrafts, setBranchDrafts] = useState<Record<string, { name: string; slug: string }>>({})
   const [regionName, setRegionName] = useState('')
   const [regionSlug, setRegionSlug] = useState('')
+  const [editingName, setEditingName] = useState<{ type: 'region' | 'branch'; id: string } | null>(null)
+  const [nameDraft, setNameDraft] = useState('')
   const [syncDefault, setSyncDefault] = useState(true)
   const [copiedBranchId, setCopiedBranchId] = useState<string | null>(null)
   const [newRuleName, setNewRuleName] = useState('')
+  const [deliveryFeeDrafts, setDeliveryFeeDrafts] = useState<Record<string, string>>({})
   const [newDeliveryPeriod, setNewDeliveryPeriod] = useState<'lunch' | 'dinner' | ''>('')
+
+  useEffect(() => {
+    setDeliveryFeeDrafts(Object.fromEntries(pricingRules.map((rule) => [rule.id, (rule.deliveryFeeSen / 100).toFixed(2)])))
+  }, [pricingRules])
 
   async function createBranch(event: FormEvent, regionId: string, regionStoreCount: number) {
     event.preventDefault(); setSaving(true); setError(null)
@@ -330,6 +339,27 @@ function Stores({ tenantSlug, regions, activeRegionId, allBranches, pricingRules
     try { const result = await createDashboardRegion({ name: regionName.trim(), slug: regionSlug.trim().toLowerCase() }); setRegionName(''); setRegionSlug(''); await onBranchesChanged(null, result.region.id) }
     catch (err) { setError(err instanceof ApiError && err.code === 'slug_taken' ? 'That region link is already in use.' : 'Region creation failed.') }
     finally { setSaving(false) }
+  }
+
+  function beginNameEdit(type: 'region' | 'branch', id: string, name: string) {
+    setEditingName({ type, id })
+    setNameDraft(name)
+    setError(null)
+  }
+
+  async function saveName(event: FormEvent) {
+    event.preventDefault()
+    if (!editingName || !nameDraft.trim()) return
+    setSaving(true); setError(null)
+    try {
+      if (editingName.type === 'region') await renameDashboardRegion(editingName.id, nameDraft.trim())
+      else await renameDashboardBranch(editingName.id, nameDraft.trim())
+      setEditingName(null)
+      setNameDraft('')
+      await onBranchesChanged()
+    } catch {
+      setError(t('Name update failed.'))
+    } finally { setSaving(false) }
   }
 
   async function uploadQr(branchId: string, file: File | undefined) {
@@ -360,6 +390,18 @@ function Stores({ tenantSlug, regions, activeRegionId, allBranches, pricingRules
     catch { setError('Price rule could not be created.') } finally { setSaving(false) }
   }
 
+  async function saveDeliveryFee(rule: DashboardPricingRule) {
+    const amount = Number(deliveryFeeDrafts[rule.id])
+    const deliveryFeeSen = Math.round(amount * 100)
+    if (!Number.isFinite(amount) || amount < 0 || !Number.isSafeInteger(deliveryFeeSen)) {
+      setError('Enter a valid delivery fee.')
+      return
+    }
+    setSaving(true); setError(null)
+    try { await updateDashboardPricingRule(rule.id, { deliveryFeeSen }); await onBranchesChanged() }
+    catch { setError('Delivery fee could not be updated.') } finally { setSaving(false) }
+  }
+
   async function changeBranchRule(branchId: string, pricingRuleId: string) {
     setSaving(true); setError(null)
     try { await assignDashboardBranchPricingRule(branchId, pricingRuleId || null); await onBranchesChanged() }
@@ -373,16 +415,16 @@ function Stores({ tenantSlug, regions, activeRegionId, allBranches, pricingRules
       {canManage && <form onSubmit={createRegion} className="mt-4 grid gap-3 border-b border-slate-100 pb-5 sm:grid-cols-[1fr_1fr_auto]"><input required value={regionName} onChange={(event) => setRegionName(event.target.value)} placeholder={t('Region name')} className="rounded-lg border border-slate-300 px-3 py-2.5 text-sm" /><input required value={regionSlug} onChange={(event) => setRegionSlug(event.target.value)} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder={t('region-link')} className="rounded-lg border border-slate-300 px-3 py-2.5 text-sm" /><button type="submit" disabled={saving || !regionName.trim() || !regionSlug.trim()} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{t('Add region')}</button></form>}
       <div className="mt-5 space-y-4">
         {regionViews.map(({ region, stores, isActive }) => <section key={region.id} className={`rounded-xl border p-4 ${isActive ? 'border-slate-400 bg-slate-50/60' : 'border-slate-200 bg-white'}`}>
-          <div className="flex flex-wrap items-baseline justify-between gap-2"><h3 className="font-semibold text-slate-950">{region.name}</h3><span className="text-xs text-slate-400">/{region.slug}</span></div>
+          <div className="flex flex-wrap items-baseline justify-between gap-2"><div className="flex flex-wrap items-center gap-2">{editingName?.type === 'region' && editingName.id === region.id ? <form onSubmit={(event) => void saveName(event)} className="flex flex-wrap items-center gap-2"><input autoFocus required maxLength={120} value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} aria-label={t('Region name')} className="rounded border border-slate-300 px-2 py-1.5 text-sm" /><button type="submit" disabled={saving || !nameDraft.trim()} className="rounded border border-slate-300 px-2 py-1.5 text-xs disabled:opacity-50">{t('Save changes')}</button><button type="button" disabled={saving} onClick={() => setEditingName(null)} className="rounded border border-slate-300 px-2 py-1.5 text-xs">{t('Cancel')}</button></form> : <><h3 className="font-semibold text-slate-950">{region.name}</h3>{canManage && <button type="button" onClick={() => beginNameEdit('region', region.id, region.name)} className="text-xs font-medium text-slate-600 hover:text-slate-950">{t('Edit')}</button>}</>} </div><span className="text-xs text-slate-400">/{region.slug}</span></div>
           <div className="mt-3 space-y-2">
-            {stores.length > 0 ? stores.map((branch) => { const link = branch.slug ? buildLocationLink(tenantSlug, region.slug, branch.slug) : ''; return <div key={branch.id} className="rounded-lg border border-slate-200 bg-white p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0"><p className="font-medium text-slate-900">{branch.name}</p><p className="truncate text-xs text-slate-500">{link}</p></div><div className="flex items-center gap-2"><a href={link} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-300 px-3 py-2 text-xs">{t('Open store')}</a><button type="button" onClick={() => void copyStoreLink(branch)} className="rounded-lg border border-slate-300 px-3 py-2 text-xs">{copiedBranchId === branch.id ? t('Copied') : t('Copy link')}</button></div></div><div className="mt-3 flex flex-wrap items-center gap-3">{branch.hasPaymentQr && <img src={`/api/dashboard/branches/${branch.id}/payment-qr`} alt={t('Payment QR code')} className="h-16 w-16 rounded border border-slate-200 object-contain p-1" />}<label className="cursor-pointer rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium hover:bg-slate-50">{branch.hasPaymentQr ? t('Change payment QR') : t('Upload payment QR')}<input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" onChange={(event) => void uploadQr(branch.id, event.target.files?.[0])} /></label>{branch.hasPaymentQr && <button type="button" onClick={() => void removeQr(branch.id)} className="text-xs text-red-600">{t('Remove payment QR')}</button>}{canManage && <label className="ml-auto text-xs font-medium text-slate-600">Price rule <select value={branch.pricingRuleId ?? ''} disabled={saving} onChange={(event) => void changeBranchRule(branch.id, event.target.value)} className="ml-2 rounded border border-slate-300 bg-white px-2 py-1.5"><option value="">Not set</option>{pricingRules.filter((rule) => rule.isActive).map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></label>}</div></div> }) : <p className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">{t('No stores in this region yet.')}</p>}
+            {stores.length > 0 ? stores.map((branch) => { const link = branch.slug ? buildLocationLink(tenantSlug, region.slug, branch.slug) : ''; return <div key={branch.id} className="rounded-lg border border-slate-200 bg-white p-3"><div className="flex flex-wrap items-center justify-between gap-3"><div className="min-w-0">{editingName?.type === 'branch' && editingName.id === branch.id ? <form onSubmit={(event) => void saveName(event)} className="flex flex-wrap items-center gap-2"><input autoFocus required maxLength={120} value={nameDraft} onChange={(event) => setNameDraft(event.target.value)} aria-label={t('Store name')} className="min-w-0 rounded border border-slate-300 px-2 py-1.5 text-sm" /><button type="submit" disabled={saving || !nameDraft.trim()} className="rounded border border-slate-300 px-2 py-1.5 text-xs disabled:opacity-50">{t('Save changes')}</button><button type="button" disabled={saving} onClick={() => setEditingName(null)} className="rounded border border-slate-300 px-2 py-1.5 text-xs">{t('Cancel')}</button></form> : <div className="flex items-center gap-2"><p className="font-medium text-slate-900">{branch.name}</p>{canManage && <button type="button" onClick={() => beginNameEdit('branch', branch.id, branch.name)} className="text-xs font-medium text-slate-600 hover:text-slate-950">{t('Edit')}</button>}</div>}<p className="truncate text-xs text-slate-500">{link}</p></div><div className="flex items-center gap-2"><a href={link} target="_blank" rel="noreferrer" className="rounded-lg border border-slate-300 px-3 py-2 text-xs">{t('Open store')}</a><button type="button" onClick={() => void copyStoreLink(branch)} className="rounded-lg border border-slate-300 px-3 py-2 text-xs">{copiedBranchId === branch.id ? t('Copied') : t('Copy link')}</button></div></div><div className="mt-3 flex flex-wrap items-center gap-3">{branch.hasPaymentQr && <img src={`/api/dashboard/branches/${branch.id}/payment-qr`} alt={t('Payment QR code')} className="h-16 w-16 rounded border border-slate-200 object-contain p-1" />}<label className="cursor-pointer rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium hover:bg-slate-50">{branch.hasPaymentQr ? t('Change payment QR') : t('Upload payment QR')}<input type="file" accept="image/png,image/jpeg,image/webp" className="sr-only" onChange={(event) => void uploadQr(branch.id, event.target.files?.[0])} /></label>{branch.hasPaymentQr && <button type="button" onClick={() => void removeQr(branch.id)} className="text-xs text-red-600">{t('Remove payment QR')}</button>}{canManage && <label className="ml-auto text-xs font-medium text-slate-600">Price rule <select value={branch.pricingRuleId ?? ''} disabled={saving} onChange={(event) => void changeBranchRule(branch.id, event.target.value)} className="ml-2 rounded border border-slate-300 bg-white px-2 py-1.5"><option value="">Not set</option>{pricingRules.filter((rule) => rule.isActive).map((rule) => <option key={rule.id} value={rule.id}>{rule.name}</option>)}</select></label>}</div></div> }) : <p className="rounded-lg border border-dashed border-slate-300 px-3 py-4 text-sm text-slate-500">{t('No stores in this region yet.')}</p>}
           </div>
           {canManage && <form onSubmit={(event) => void createBranch(event, region.id, stores.length)} className="mt-4 border-t border-slate-200 pt-4"><div className="grid gap-3 sm:grid-cols-2"><input required value={branchDrafts[region.id]?.name ?? ''} onChange={(event) => setBranchDrafts((current) => ({ ...current, [region.id]: { ...current[region.id], name: event.target.value, slug: current[region.id]?.slug ?? '' } }))} placeholder={t('Store name')} className="rounded-lg border border-slate-300 px-3 py-2.5 text-sm" /><input required value={branchDrafts[region.id]?.slug ?? ''} onChange={(event) => setBranchDrafts((current) => ({ ...current, [region.id]: { ...current[region.id], name: current[region.id]?.name ?? '', slug: event.target.value } }))} pattern="[a-z0-9]+(?:-[a-z0-9]+)*" placeholder={t('store-link')} className="rounded-lg border border-slate-300 px-3 py-2.5 text-sm" /><select aria-label="Delivery period" value={newDeliveryPeriod} onChange={(event) => setNewDeliveryPeriod(event.target.value as 'lunch' | 'dinner' | '')} className="rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm"><option value="">Any meal period</option><option value="lunch">Morning / lunch</option><option value="dinner">Afternoon / dinner</option></select></div><label className="mt-3 flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={syncDefault} onChange={(event) => setSyncDefault(event.target.checked)} />{t('Copy the default menu once')}</label><button type="submit" disabled={saving || !branchDrafts[region.id]?.name.trim() || !branchDrafts[region.id]?.slug.trim()} className="mt-3 rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">{t('Add store')}</button></form>}
         </section>)}
       </div>
       {error && <p role="alert" className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
     </section>
-    <section className="max-w-3xl rounded-xl border border-slate-200 bg-white p-5"><h2 className="font-semibold">Price rules</h2><p className="mt-1 text-sm text-slate-500">Set the price adjustment each location uses, including delivery fees.</p>{canManage && <form onSubmit={createRule} className="mt-4 flex gap-2"><input required value={newRuleName} onChange={(event) => setNewRuleName(event.target.value)} maxLength={80} placeholder="e.g. Klang Valley delivery" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2.5 text-sm" /><button type="submit" disabled={saving || !newRuleName.trim()} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">Add rule</button></form>}<div className="mt-4 divide-y divide-slate-100">{pricingRules.map((rule) => <div key={rule.id} className="flex items-center justify-between gap-3 py-3"><span className="font-medium">{rule.name}</span>{canManage && <div className="flex items-center gap-2"><button type="button" onClick={() => void updateDashboardPricingRule(rule.id, { isActive: !rule.isActive }).then(() => onBranchesChanged())} className="rounded border border-slate-300 px-2 py-1 text-xs">{rule.isActive ? 'Active' : 'Inactive'}</button><button type="button" onClick={() => void deleteDashboardPricingRule(rule.id).then(() => onBranchesChanged()).catch(() => setError('This price rule is still used by a location or meal.'))} className="text-xs text-red-600">Delete</button></div>}</div>)}{pricingRules.length === 0 && <p className="py-4 text-sm text-slate-500">Add a rule before creating scheduled meals.</p>}</div></section>
+    <section className="max-w-3xl rounded-xl border border-slate-200 bg-white p-5"><h2 className="font-semibold">Price rules</h2><p className="mt-1 text-sm text-slate-500">Set the fixed delivery fee charged once per order. Meal prices stay at their listed base price.</p>{canManage && <form onSubmit={createRule} className="mt-4 flex gap-2"><input required value={newRuleName} onChange={(event) => setNewRuleName(event.target.value)} maxLength={80} placeholder="e.g. Klang Valley delivery" className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2.5 text-sm" /><button type="submit" disabled={saving || !newRuleName.trim()} className="rounded-lg bg-slate-950 px-4 py-2.5 text-sm font-medium text-white disabled:opacity-50">Add rule</button></form>}<div className="mt-4 divide-y divide-slate-100">{pricingRules.map((rule) => <div key={rule.id} className="flex flex-wrap items-center justify-between gap-3 py-3"><div><span className="font-medium">{rule.name}</span><label className="ml-4 text-xs text-slate-600">Delivery fee (RM)<input disabled={!canManage || saving} value={deliveryFeeDrafts[rule.id] ?? '0.00'} onChange={(event) => setDeliveryFeeDrafts((current) => ({ ...current, [rule.id]: event.target.value }))} type="number" min="0" step="0.01" className="ml-2 w-28 rounded border border-slate-300 px-2 py-1.5 text-sm" /></label></div>{canManage && <div className="flex items-center gap-2"><button type="button" disabled={saving || deliveryFeeDrafts[rule.id] === (rule.deliveryFeeSen / 100).toFixed(2)} onClick={() => void saveDeliveryFee(rule)} className="rounded border border-slate-300 px-2 py-1 text-xs disabled:opacity-50">Save fee</button><button type="button" onClick={() => void updateDashboardPricingRule(rule.id, { isActive: !rule.isActive }).then(() => onBranchesChanged())} className="rounded border border-slate-300 px-2 py-1 text-xs">{rule.isActive ? 'Active' : 'Inactive'}</button><button type="button" onClick={() => void deleteDashboardPricingRule(rule.id).then(() => onBranchesChanged()).catch(() => setError('This price rule is still used by a location or meal.'))} className="text-xs text-red-600">Delete</button></div>}</div>)}{pricingRules.length === 0 && <p className="py-4 text-sm text-slate-500">Add a rule before creating scheduled meals.</p>}</div></section>
   </div>
 }
 
@@ -396,7 +438,6 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
   const [cutoffMalaysiaTime, setCutoffMalaysiaTime] = useState('09:00')
   const [weeklyDay, setWeeklyDay] = useState(1)
   const [weeklyCutoffTime, setWeeklyCutoffTime] = useState('09:00')
-  const [rulePriceDrafts, setRulePriceDrafts] = useState<Record<string, string>>({})
   const [categoryId, setCategoryId] = useState('')
   const [categoryName, setCategoryName] = useState('')
   const [imageUrl, setImageUrl] = useState<string | null>(null)
@@ -412,7 +453,6 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
   const [editingCutoffMalaysiaTime, setEditingCutoffMalaysiaTime] = useState('09:00')
   const [editingWeeklyDay, setEditingWeeklyDay] = useState(1)
   const [editingWeeklyCutoffTime, setEditingWeeklyCutoffTime] = useState('09:00')
-  const [editingRulePriceDrafts, setEditingRulePriceDrafts] = useState<Record<string, string>>({})
   const [imageLoading, setImageLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -440,11 +480,10 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
   async function addProduct() {
     const priceSen = Math.round(Number(price) * 100)
     if (!productName.trim() || !Number.isFinite(priceSen) || priceSen < 0) { setError(t('Enter a valid product name and price.')); return }
-    const rulePrices = buildRulePrices(kind, rulePriceDrafts, pricingRules)
-    const scheduleError = validateScheduledMealDraft({ kind, serviceDate, servicePeriod, cutoffMalaysiaTime, weeklyDay, weeklyCutoffTime, rulePrices }, pricingRules)
+    const scheduleError = validateScheduledMealDraft({ kind, serviceDate, servicePeriod, cutoffMalaysiaTime, weeklyDay, weeklyCutoffTime })
     if (scheduleError) { setError(scheduleError); return }
     setSaving(true); setError(null)
-    try { await createDashboardProduct({ name: productName.trim(), imageUrl, priceSen, categoryId: categoryId || null, isPublic: true, isAvailable: true, kind, serviceDate: kind === 'scheduled_meal' ? serviceDate : undefined, servicePeriod, cutoffMalaysiaTime, weeklyDay: kind === 'recurring_meal' ? weeklyDay : undefined, weeklyCutoffTime: kind === 'recurring_meal' ? weeklyCutoffTime : undefined, rulePrices, branchId }); setProductName(''); setPrice(''); setCategoryId(''); setImageUrl(null); setServiceDate(''); setRulePriceDrafts({}); await onCreated() } catch (err) { setError(err instanceof ApiError && err.code === 'invalid_scheduled_meal' ? 'Set a location price rule and prices for this meal.' : t('Product creation failed.')) } finally { setSaving(false) }
+    try { await createDashboardProduct({ name: productName.trim(), imageUrl, priceSen, categoryId: categoryId || null, isPublic: true, isAvailable: true, kind, serviceDate: kind === 'scheduled_meal' ? serviceDate : undefined, servicePeriod, cutoffMalaysiaTime, weeklyDay: kind === 'recurring_meal' ? weeklyDay : undefined, weeklyCutoffTime: kind === 'recurring_meal' ? weeklyCutoffTime : undefined, branchId }); setProductName(''); setPrice(''); setCategoryId(''); setImageUrl(null); setServiceDate(''); await onCreated() } catch (err) { setError(err instanceof ApiError && err.code === 'invalid_scheduled_meal' ? 'Assign an active price rule to this location before publishing a meal.' : t('Product creation failed.')) } finally { setSaving(false) }
   }
 
   async function toggleAvailability(product: DashboardProduct) {
@@ -476,7 +515,6 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
     setEditingCutoffMalaysiaTime(formatMalaysiaTime(product.orderCutoffAt) || (product.servicePeriod === 'dinner' ? '13:00' : '09:00'))
     setEditingWeeklyDay(product.weeklyDay ?? 1)
     setEditingWeeklyCutoffTime(product.weeklyCutoffTime ?? (product.servicePeriod === 'dinner' ? '13:00' : '09:00'))
-    setEditingRulePriceDrafts(Object.fromEntries(pricingRules.filter((rule) => rule.isActive).map((rule) => [rule.id, ((product.rulePrices.find((price) => price.pricingRuleId === rule.id)?.priceSen ?? 0) / 100).toFixed(2)])))
     setError(null)
   }
 
@@ -492,13 +530,11 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
     setEditingCutoffMalaysiaTime('09:00')
     setEditingWeeklyDay(1)
     setEditingWeeklyCutoffTime('09:00')
-    setEditingRulePriceDrafts({})
   }
 
   async function saveProduct(productId: string) {
     const priceSen = Math.round(Number(editingPrice) * 100)
     if (!editingName.trim() || !Number.isFinite(priceSen) || priceSen < 0) { setError(t('Enter a valid product name and price.')); return }
-    const rulePrices = buildRulePrices(editingKind, editingRulePriceDrafts, pricingRules)
     const scheduleError = validateScheduledMealDraft({
       kind: editingKind,
       serviceDate: editingServiceDate,
@@ -506,8 +542,7 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
       cutoffMalaysiaTime: editingCutoffMalaysiaTime,
       weeklyDay: editingWeeklyDay,
       weeklyCutoffTime: editingWeeklyCutoffTime,
-      rulePrices,
-    }, pricingRules)
+    })
     if (scheduleError) { setError(scheduleError); return }
     setSaving(true); setError(null)
     try {
@@ -519,7 +554,6 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
         cutoffMalaysiaTime: editingKind === 'scheduled_meal' ? editingCutoffMalaysiaTime : undefined,
         weeklyDay: editingKind === 'recurring_meal' ? editingWeeklyDay : undefined,
         weeklyCutoffTime: editingKind === 'recurring_meal' ? editingWeeklyCutoffTime : undefined,
-        rulePrices,
       }, branchId)
       cancelEditing()
       await onCreated()
@@ -542,13 +576,13 @@ function Catalog({ products, categories, pricingRules, branchId, canManage, onCr
     <section className="rounded-xl border border-slate-200 bg-white p-4">
       <div className="flex items-start justify-between gap-3"><div><h2 className="font-semibold">{t('Product catalog')}</h2><p className="mt-1 text-sm text-slate-500">{t("Manage products in the current organization's public stores.")}</p></div>{!canManage && <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-500">{t('Read only')}</span>}</div>
       {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
-      {canManage && <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex gap-1 rounded-md bg-slate-200/70 p-1"><button type="button" onClick={() => setKind('add_on')} className={`rounded px-3 py-1.5 text-sm ${kind === 'add_on' ? 'bg-white shadow-sm' : 'text-slate-600'}`}>Add-on</button><button type="button" onClick={() => setKind('scheduled_meal')} className={`rounded px-3 py-1.5 text-sm ${kind === 'scheduled_meal' ? 'bg-white shadow-sm' : 'text-slate-600'}`}>One-time meal</button><button type="button" onClick={() => setKind('recurring_meal')} className={`rounded px-3 py-1.5 text-sm ${kind === 'recurring_meal' ? 'bg-white shadow-sm' : 'text-slate-600'}`}>Weekly meal</button></div>{kind !== 'add_on' && <div className="mt-3 grid gap-3 md:grid-cols-3">{kind === 'recurring_meal' ? <><label className="text-sm font-medium">Repeat every week<select value={weeklyDay} onChange={(event) => setWeeklyDay(Number(event.target.value))} className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5"><option value={1}>Monday</option><option value={2}>Tuesday</option><option value={3}>Wednesday</option><option value={4}>Thursday</option><option value={5}>Friday</option></select></label><label className="text-sm font-medium">Meal period<select value={servicePeriod} onChange={(event) => { const next = event.target.value as 'lunch' | 'dinner'; setServicePeriod(next); setWeeklyCutoffTime(next === 'lunch' ? '09:00' : '13:00') }} className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5"><option value="lunch">Lunch</option><option value="dinner">Dinner</option></select></label><label className="text-sm font-medium">Order cutoff, Malaysia time<input value={weeklyCutoffTime} onChange={(event) => setWeeklyCutoffTime(event.target.value)} type="time" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label></> : <><label className="text-sm font-medium">Service date<input value={serviceDate} onChange={(event) => setServiceDate(event.target.value)} type="date" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label><label className="text-sm font-medium">Meal period<select value={servicePeriod} onChange={(event) => { const next = event.target.value as 'lunch' | 'dinner'; setServicePeriod(next); setCutoffMalaysiaTime(next === 'lunch' ? '09:00' : '13:00') }} className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5"><option value="lunch">Lunch</option><option value="dinner">Dinner</option></select></label><label className="text-sm font-medium">Cutoff, Malaysia time<input value={cutoffMalaysiaTime} onChange={(event) => setCutoffMalaysiaTime(event.target.value)} type="time" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label></>}<div className="col-span-full grid gap-2 sm:grid-cols-2">{pricingRules.filter((rule) => rule.isActive).map((rule) => <label key={rule.id} className="text-sm font-medium">{rule.name} adjustment (RM)<input value={getRulePriceInputValue(rulePriceDrafts, rule.id)} onChange={(event) => setRulePriceDrafts((current) => ({ ...current, [rule.id]: event.target.value }))} type="number" min="0" step="0.01" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label>)}</div>{pricingRules.filter((rule) => rule.isActive).length === 0 && <p className="col-span-full text-sm text-amber-800">Assign a price rule to this location before publishing a meal.</p>}</div>}</div>}
+      {canManage && <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3"><div className="flex gap-1 rounded-md bg-slate-200/70 p-1"><button type="button" onClick={() => setKind('add_on')} className={`rounded px-3 py-1.5 text-sm ${kind === 'add_on' ? 'bg-white shadow-sm' : 'text-slate-600'}`}>Add-on</button><button type="button" onClick={() => setKind('scheduled_meal')} className={`rounded px-3 py-1.5 text-sm ${kind === 'scheduled_meal' ? 'bg-white shadow-sm' : 'text-slate-600'}`}>One-time meal</button><button type="button" onClick={() => setKind('recurring_meal')} className={`rounded px-3 py-1.5 text-sm ${kind === 'recurring_meal' ? 'bg-white shadow-sm' : 'text-slate-600'}`}>Weekly meal</button></div>{kind !== 'add_on' && <div className="mt-3 grid gap-3 md:grid-cols-3">{kind === 'recurring_meal' ? <><label className="text-sm font-medium">Repeat every week<select value={weeklyDay} onChange={(event) => setWeeklyDay(Number(event.target.value))} className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5"><option value={1}>Monday</option><option value={2}>Tuesday</option><option value={3}>Wednesday</option><option value={4}>Thursday</option><option value={5}>Friday</option></select></label><label className="text-sm font-medium">Meal period<select value={servicePeriod} onChange={(event) => { const next = event.target.value as 'lunch' | 'dinner'; setServicePeriod(next); setWeeklyCutoffTime(next === 'lunch' ? '09:00' : '13:00') }} className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5"><option value="lunch">Lunch</option><option value="dinner">Dinner</option></select></label><label className="text-sm font-medium">Order cutoff, Malaysia time<input value={weeklyCutoffTime} onChange={(event) => setWeeklyCutoffTime(event.target.value)} type="time" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label></> : <><label className="text-sm font-medium">Service date<input value={serviceDate} onChange={(event) => setServiceDate(event.target.value)} type="date" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label><label className="text-sm font-medium">Meal period<select value={servicePeriod} onChange={(event) => { const next = event.target.value as 'lunch' | 'dinner'; setServicePeriod(next); setCutoffMalaysiaTime(next === 'lunch' ? '09:00' : '13:00') }} className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5"><option value="lunch">Lunch</option><option value="dinner">Dinner</option></select></label><label className="text-sm font-medium">Cutoff, Malaysia time<input value={cutoffMalaysiaTime} onChange={(event) => setCutoffMalaysiaTime(event.target.value)} type="time" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label></>}{pricingRules.filter((rule) => rule.isActive).length === 0 && <p className="col-span-full text-sm text-amber-800">Assign a price rule to this location before publishing a meal.</p>}</div>}</div>}
       {canManage && <div className="mt-4 space-y-3 border-t border-slate-100 pt-4"><div className="grid gap-3 md:grid-cols-[1fr_140px_180px_auto]"><input value={productName} onChange={(event) => setProductName(event.target.value)} placeholder={t('Product name')} aria-label={t('Product name')} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" /><input value={price} onChange={(event) => setPrice(event.target.value)} placeholder={t('Price RM')} type="number" min="0" step="0.01" aria-label={t('Price RM')} className="rounded-lg border border-slate-300 px-3 py-2 text-sm" /><select value={categoryId} onChange={(event) => setCategoryId(event.target.value)} aria-label={t('Product category')} className="rounded-lg border border-slate-300 px-3 py-2 text-sm"><option value="">{t('Uncategorized')}</option>{categories.map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</select><button type="button" onClick={() => void addProduct()} disabled={saving || imageLoading} className="rounded-lg bg-slate-950 px-4 py-2 text-sm font-medium text-white disabled:opacity-50">{t('Add product')}</button></div><div className="flex flex-wrap items-center gap-3"><label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50"><input type="file" accept="image/*" onChange={(event) => void handleImage(event, 'new')} className="sr-only" />{imageLoading ? t('Image is being optimized...') : imageUrl ? t('Change image') : t('Upload image')}</label>{imageUrl && <><img src={imageUrl} alt={t('Product image')} className="h-12 w-12 rounded-lg object-cover" /><button type="button" onClick={() => setImageUrl(null)} className="text-xs font-medium text-red-600">{t('Remove image')}</button></>}</div></div>}
     </section>
     <section className="overflow-hidden rounded-xl border border-slate-200 bg-white">
       <div className="border-b border-slate-200 px-4 py-4"><h3 className="font-semibold">{t('Existing products')}</h3></div>
       {products.length === 0 ? <p className="px-4 py-10 text-center text-sm text-slate-500">{t('No products yet.')}</p> : <div className="divide-y divide-slate-100">{products.map((product) => editingId === product.id
-        ? <ProductEditPanel key={product.id} categories={categories} pricingRules={pricingRules} name={editingName} price={editingPrice} categoryId={editingCategoryId} imageUrl={editingImageUrl} available={editingAvailable} kind={editingKind} serviceDate={editingServiceDate} servicePeriod={editingServicePeriod} cutoffMalaysiaTime={editingCutoffMalaysiaTime} weeklyDay={editingWeeklyDay} weeklyCutoffTime={editingWeeklyCutoffTime} rulePriceDrafts={editingRulePriceDrafts} saving={saving} imageLoading={imageLoading} onNameChange={setEditingName} onPriceChange={setEditingPrice} onCategoryChange={setEditingCategoryId} onImage={(event) => void handleImage(event, 'edit')} onImageRemove={() => setEditingImageUrl(null)} onAvailableChange={setEditingAvailable} onKindChange={setEditingKind} onServiceDateChange={setEditingServiceDate} onServicePeriodChange={setEditingServicePeriod} onCutoffChange={setEditingCutoffMalaysiaTime} onWeeklyDayChange={setEditingWeeklyDay} onWeeklyCutoffChange={setEditingWeeklyCutoffTime} onRulePriceChange={(ruleId, value) => setEditingRulePriceDrafts((current) => ({ ...current, [ruleId]: value }))} onSave={() => void saveProduct(product.id)} onCancel={cancelEditing} />
+        ? <ProductEditPanel key={product.id} categories={categories} name={editingName} price={editingPrice} categoryId={editingCategoryId} imageUrl={editingImageUrl} available={editingAvailable} kind={editingKind} serviceDate={editingServiceDate} servicePeriod={editingServicePeriod} cutoffMalaysiaTime={editingCutoffMalaysiaTime} weeklyDay={editingWeeklyDay} weeklyCutoffTime={editingWeeklyCutoffTime} saving={saving} imageLoading={imageLoading} onNameChange={setEditingName} onPriceChange={setEditingPrice} onCategoryChange={setEditingCategoryId} onImage={(event) => void handleImage(event, 'edit')} onImageRemove={() => setEditingImageUrl(null)} onAvailableChange={setEditingAvailable} onKindChange={setEditingKind} onServiceDateChange={setEditingServiceDate} onServicePeriodChange={setEditingServicePeriod} onCutoffChange={setEditingCutoffMalaysiaTime} onWeeklyDayChange={setEditingWeeklyDay} onWeeklyCutoffChange={setEditingWeeklyCutoffTime} onSave={() => void saveProduct(product.id)} onCancel={cancelEditing} />
         : <div key={product.id} className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:gap-4"><div className="flex min-w-0 items-center gap-3">{product.imageUrl && <img src={product.imageUrl} alt="" className="h-12 w-12 shrink-0 rounded-lg object-cover" />}<div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><p className="break-words font-medium">{product.name}</p><span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] font-medium text-slate-600">{productKindLabel(getProductKind(product))}</span></div><p className="text-sm text-slate-500">{formatSen(product.priceSen)} · {product.categoryName ?? t('Uncategorized')}</p></div></div><div className="flex flex-wrap items-center gap-2"><button type="button" disabled={!canManage} onClick={() => startEditing(product)} className="rounded-lg border border-slate-300 px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-50 disabled:opacity-50">{t('Edit')}</button><button type="button" disabled={!canManage} onClick={() => void toggleAvailability(product)} className={`rounded-full px-2.5 py-1 text-xs font-medium ${product.isAvailable ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'}`}>{product.isAvailable ? t('Available') : t('Unavailable')}</button><button type="button" disabled={!canManage} onClick={() => void deleteProduct(product)} className="rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50">{t('Delete')}</button></div></div>)} </div>}
     </section>
     <section className="rounded-xl border border-slate-200 bg-white p-4"><h3 className="font-semibold">{t('Categories')}</h3>{canManage && <form onSubmit={addCategory} className="mt-3 flex gap-2"><input required value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder={t('New category name')} aria-label={t('New category name')} className="min-w-0 flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm" /><button type="submit" disabled={saving} className="rounded-lg border border-slate-300 px-3 py-2 text-sm font-medium hover:bg-slate-50 disabled:opacity-50">{t('Add category')}</button></form>}<div className="mt-4 flex flex-wrap gap-2">{categories.map((category) => <span key={category.id} className="inline-flex items-center gap-2 rounded-full bg-slate-100 pl-3 pr-2 py-1 text-sm text-slate-600">{category.name}{canManage && <button type="button" disabled={saving} onClick={() => void deleteCategory(category)} className="rounded-full px-1.5 py-0.5 text-xs font-medium text-red-700 hover:bg-red-100 disabled:opacity-50">{t('Delete')}</button>}</span>)}</div></section>
@@ -561,7 +595,6 @@ function productKindLabel(kind: ProductKind) {
 
 type ProductEditPanelProps = {
   categories: DashboardCategory[]
-  pricingRules: DashboardPricingRule[]
   name: string
   price: string
   categoryId: string
@@ -573,7 +606,6 @@ type ProductEditPanelProps = {
   cutoffMalaysiaTime: string
   weeklyDay: number
   weeklyCutoffTime: string
-  rulePriceDrafts: Record<string, string>
   saving: boolean
   imageLoading: boolean
   onNameChange: (value: string) => void
@@ -588,12 +620,11 @@ type ProductEditPanelProps = {
   onCutoffChange: (value: string) => void
   onWeeklyDayChange: (value: number) => void
   onWeeklyCutoffChange: (value: string) => void
-  onRulePriceChange: (ruleId: string, value: string) => void
   onSave: () => void
   onCancel: () => void
 }
 
-function ProductEditPanel({ categories, pricingRules, name, price, categoryId, imageUrl, available, kind, serviceDate, servicePeriod, cutoffMalaysiaTime, weeklyDay, weeklyCutoffTime, rulePriceDrafts, saving, imageLoading, onNameChange, onPriceChange, onCategoryChange, onImage, onImageRemove, onAvailableChange, onKindChange, onServiceDateChange, onServicePeriodChange, onCutoffChange, onWeeklyDayChange, onWeeklyCutoffChange, onRulePriceChange, onSave, onCancel }: ProductEditPanelProps) {
+function ProductEditPanel({ categories, name, price, categoryId, imageUrl, available, kind, serviceDate, servicePeriod, cutoffMalaysiaTime, weeklyDay, weeklyCutoffTime, saving, imageLoading, onNameChange, onPriceChange, onCategoryChange, onImage, onImageRemove, onAvailableChange, onKindChange, onServiceDateChange, onServicePeriodChange, onCutoffChange, onWeeklyDayChange, onWeeklyCutoffChange, onSave, onCancel }: ProductEditPanelProps) {
   return <div className="space-y-3 bg-slate-50 px-4 py-4">
     <div className="grid gap-3 md:grid-cols-[1fr_140px_180px]">
       <input value={name} onChange={(event) => onNameChange(event.target.value)} aria-label="Product name" className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm" />
@@ -608,7 +639,6 @@ function ProductEditPanel({ categories, pricingRules, name, price, categoryId, i
       {kind === 'scheduled_meal' && <label className="text-sm font-medium">Cutoff, Malaysia time<input value={cutoffMalaysiaTime} onChange={(event) => onCutoffChange(event.target.value)} type="time" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label>}
       {kind === 'recurring_meal' && <label className="text-sm font-medium">Order cutoff, Malaysia time<input value={weeklyCutoffTime} onChange={(event) => onWeeklyCutoffChange(event.target.value)} type="time" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label>}
     </div>
-    {kind !== 'add_on' && <div className="grid gap-2 sm:grid-cols-2">{pricingRules.filter((rule) => rule.isActive).map((rule) => <label key={rule.id} className="text-sm font-medium">{rule.name} adjustment (RM)<input value={getRulePriceInputValue(rulePriceDrafts, rule.id)} onChange={(event) => onRulePriceChange(rule.id, event.target.value)} type="number" min="0" step="0.01" className="mt-1 block w-full rounded border border-slate-300 bg-white px-2 py-1.5" /></label>)}</div>}
     <div className="flex flex-wrap items-center gap-3"><label className="inline-flex cursor-pointer items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium hover:bg-slate-50"><input type="file" accept="image/*" onChange={onImage} className="sr-only" />{imageLoading ? 'Image is being optimized...' : imageUrl ? 'Change image' : 'Upload image'}</label>{imageUrl && <><img src={imageUrl} alt="Product image" className="h-12 w-12 rounded-lg object-cover" /><button type="button" onClick={onImageRemove} className="text-xs font-medium text-red-600">Remove image</button></>}<label className="inline-flex items-center gap-2 text-sm text-slate-600"><input type="checkbox" checked={available} onChange={(event) => onAvailableChange(event.target.checked)} />Available</label></div>
     <div className="flex flex-wrap gap-2"><button type="button" disabled={saving || imageLoading} onClick={onSave} className="rounded-lg bg-slate-950 px-3 py-2 text-sm font-medium text-white disabled:opacity-50">Save changes</button><button type="button" disabled={saving} onClick={onCancel} className="rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 disabled:opacity-50">Cancel</button></div>
     <p className="text-xs text-slate-500">Editing {productKindLabel(kind)} settings.</p>

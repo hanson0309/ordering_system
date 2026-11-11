@@ -1,5 +1,5 @@
-import { and, eq, inArray } from 'drizzle-orm'
-import { branches, pricingRules, scheduledMealPrices } from '../db/schema'
+import { and, eq } from 'drizzle-orm'
+import { branches, pricingRules } from '../db/schema'
 import type { Db } from '../db/client'
 
 export type ServicePeriod = 'lunch' | 'dinner'
@@ -74,17 +74,9 @@ export function isScheduledMealOpen(product: ScheduleFields, now = new Date()): 
   )
 }
 
-export async function resolveEffectiveProductPrices<T extends ScheduleFields & { id: string; priceSen: number }>(
-  db: Db,
-  tenantId: string,
-  branchId: string,
-  productRows: T[],
-  now = new Date(),
-): Promise<Array<T & { effectivePriceSen: number; pricingRuleName: string }>> {
-  if (productRows.length === 0) return []
-
+export async function getBranchPricingRule(db: Db, tenantId: string, branchId: string) {
   const [rule] = await db
-    .select({ id: pricingRules.id, name: pricingRules.name })
+    .select({ id: pricingRules.id, name: pricingRules.name, deliveryFeeSen: pricingRules.deliveryFeeSen })
     .from(branches)
     .innerJoin(
       pricingRules,
@@ -96,22 +88,24 @@ export async function resolveEffectiveProductPrices<T extends ScheduleFields & {
     )
     .where(and(eq(branches.id, branchId), eq(branches.tenantId, tenantId)))
     .limit(1)
+  return rule ?? null
+}
+
+export async function resolveEffectiveProductPrices<T extends ScheduleFields & { id: string; priceSen: number }>(
+  db: Db,
+  tenantId: string,
+  branchId: string,
+  productRows: T[],
+  now = new Date(),
+): Promise<Array<T & { effectivePriceSen: number; pricingRuleName: string; deliveryFeeSen: number }>> {
+  if (productRows.length === 0) return []
+
+  const rule = await getBranchPricingRule(db, tenantId, branchId)
   if (!rule) return []
 
-  const prices = await db
-    .select({ productId: scheduledMealPrices.productId, priceSen: scheduledMealPrices.priceSen })
-    .from(scheduledMealPrices)
-    .where(and(
-      eq(scheduledMealPrices.tenantId, tenantId),
-      eq(scheduledMealPrices.pricingRuleId, rule.id),
-      inArray(scheduledMealPrices.productId, productRows.map(({ id }) => id)),
-    ))
-  const priceByProductId = new Map(prices.map((price) => [price.productId, price.priceSen]))
-
   return productRows.flatMap((product) => {
-    const adjustmentSen = priceByProductId.get(product.id)
-    return isScheduledMealOpen(product, now) && adjustmentSen !== undefined
-      ? [{ ...product, effectivePriceSen: product.priceSen + adjustmentSen, pricingRuleName: rule.name }]
+    return isScheduledMealOpen(product, now)
+      ? [{ ...product, effectivePriceSen: product.priceSen, pricingRuleName: rule.name, deliveryFeeSen: rule.deliveryFeeSen }]
       : []
   })
 }

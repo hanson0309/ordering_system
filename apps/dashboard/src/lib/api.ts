@@ -89,6 +89,7 @@ export interface DashboardProduct {
 export interface DashboardPricingRule {
   id: string
   name: string
+  deliveryFeeSen: number
   isActive: boolean
   sortOrder: number
 }
@@ -240,6 +241,10 @@ export function createDashboardRegion(input: { name: string; slug: string }) {
   return request<{ region: DashboardRegion }>('/dashboard/regions', { method: 'POST', body: JSON.stringify(input) })
 }
 
+export function renameDashboardRegion(regionId: string, name: string) {
+  return request<{ regionId: string; name: string }>(`/dashboard/regions/${encodeURIComponent(regionId)}`, { method: 'PATCH', body: JSON.stringify({ name }) })
+}
+
 export function getDashboardBranches(regionId?: string | null) {
   return request<{ branches: DashboardBranch[] }>(`/dashboard/branches${regionId ? `?regionId=${encodeURIComponent(regionId)}` : ''}`)
 }
@@ -248,11 +253,11 @@ export function getDashboardPricingRules() {
   return request<{ pricingRules: DashboardPricingRule[] }>('/dashboard/pricing-rules')
 }
 
-export function createDashboardPricingRule(input: { name: string; isActive?: boolean; sortOrder?: number }) {
+export function createDashboardPricingRule(input: { name: string; deliveryFeeSen?: number; isActive?: boolean; sortOrder?: number }) {
   return request<{ pricingRule: DashboardPricingRule }>('/dashboard/pricing-rules', { method: 'POST', body: JSON.stringify(input) })
 }
 
-export function updateDashboardPricingRule(pricingRuleId: string, input: Partial<{ name: string; isActive: boolean; sortOrder: number }>) {
+export function updateDashboardPricingRule(pricingRuleId: string, input: Partial<{ name: string; deliveryFeeSen: number; isActive: boolean; sortOrder: number }>) {
   return request<{ pricingRuleId: string }>(`/dashboard/pricing-rules/${pricingRuleId}`, { method: 'PATCH', body: JSON.stringify(input) })
 }
 
@@ -268,6 +273,10 @@ export function assignDashboardBranchPricingRule(branchId: string, pricingRuleId
 
 export function createDashboardBranch(input: { regionId: string; name: string; slug: string; address?: string | null; deliveryPeriod?: 'lunch' | 'dinner' | null; syncDefault: boolean; makeDefault: boolean }) {
   return request<{ branch: DashboardBranch; syncedDefault: boolean }>('/dashboard/branches', { method: 'POST', body: JSON.stringify(input) })
+}
+
+export function renameDashboardBranch(branchId: string, name: string) {
+  return request<{ branchId: string; name: string }>(`/dashboard/branches/${encodeURIComponent(branchId)}`, { method: 'PATCH', body: JSON.stringify({ name }) })
 }
 
 export function makeDashboardBranchDefault(branchId: string) {

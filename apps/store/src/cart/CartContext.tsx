@@ -17,13 +17,16 @@ interface CartState {
   setQuantity: (product: Product, quantity: number) => void
   clear: () => void
   totalSen: number
+  subtotalSen: number
+  deliveryFeeSen: number
+  pricingRuleName: string | null
   totalItems: number
 }
 
 const CartContext = createContext<CartState | null>(null)
 
 function storageKey(slug: string) {
-  return `cart:${slug}`
+  return `cart:v2:${slug}`
 }
 
 export function CartProvider({ slug, children }: { slug: string; children: ReactNode }) {
@@ -67,10 +70,13 @@ export function CartProvider({ slug, children }: { slug: string; children: React
     }
     const clear = () => setLines([])
 
-    const totalSen = lines.reduce((sum, l) => sum + l.product.priceSen * l.quantity, 0)
+    const subtotalSen = lines.reduce((sum, l) => sum + l.product.priceSen * l.quantity, 0)
+    const deliveryFeeSen = lines.length > 0 ? lines[0].product.deliveryFeeSen ?? 0 : 0
+    const pricingRuleName = lines.length > 0 ? lines[0].product.pricingRuleName ?? null : null
+    const totalSen = subtotalSen + deliveryFeeSen
     const totalItems = lines.reduce((sum, l) => sum + l.quantity, 0)
 
-    return { lines, addItem, removeItem, setQuantity, clear, totalSen, totalItems }
+    return { lines, addItem, removeItem, setQuantity, clear, totalSen, subtotalSen, deliveryFeeSen, pricingRuleName, totalItems }
   }, [lines])
 
   return <CartContext.Provider value={value}>{children}</CartContext.Provider>

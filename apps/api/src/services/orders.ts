@@ -8,6 +8,7 @@ import {
   isScheduledMealOpen,
   isWeeklyMeal,
   getMalaysiaDate,
+  getBranchPricingRule,
   malaysiaWeekday,
   parseMalaysiaCutoff,
   resolveEffectiveProductPrices,
@@ -80,6 +81,7 @@ export async function createOrder(
       throw new OrderValidationError('invalid_product')
     }
   }
+  const pricingRule = branchId ? await getBranchPricingRule(db, tenantId, branchId) : null
 
   const keyFor = (productId: string, serviceDate?: string) => `${productId}:${serviceDate ?? ''}`
   const scheduleByItem = new Map<string, typeof productRows[number]>()
@@ -145,7 +147,7 @@ export async function createOrder(
   const customerId = existingCustomer?.id ?? newId('cust')
   const totalSen = input.items.reduce((sum, item) => {
     return sum + effectivePriceByProductId.get(keyFor(item.productId, item.serviceDate))!.priceSen * item.quantity
-  }, 0)
+  }, pricingRule?.deliveryFeeSen ?? 0)
 
   for (let attempt = 0; attempt < 3; attempt++) {
     const orderId = newId('order')
@@ -158,6 +160,8 @@ export async function createOrder(
       orderNumber,
       customerId,
       remark: input.remark?.trim() || null,
+      deliveryFeeSenSnapshot: pricingRule?.deliveryFeeSen ?? 0,
+      pricingRuleNameSnapshot: pricingRule?.name ?? null,
       totalSen,
       idempotencyKey: input.idempotencyKey,
     })

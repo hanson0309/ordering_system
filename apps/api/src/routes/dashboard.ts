@@ -63,6 +63,7 @@ const updateDashboardUserSchema = z.object({
 
 const pricingRuleSchema = z.object({
   name: z.string().trim().min(1).max(80),
+  deliveryFeeSen: z.number().int().min(0).max(100000000).optional(),
   isActive: z.boolean().optional(),
   sortOrder: z.number().int().min(0).max(10000).optional(),
 })
@@ -172,6 +173,8 @@ const regionSchema = z.object({
   slug: z.string().trim().min(1).max(80).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/),
 })
 
+const nameUpdateSchema = z.object({ name: z.string().trim().min(1).max(120) })
+
 dashboardRoutes.get('/regions', async (c) => {
   const tenantId = c.get('tenant').tenantId
   const rows = await createDb(c.env)
@@ -193,6 +196,17 @@ dashboardRoutes.post('/regions', requireRole('admin'), async (c) => {
   const region = { id: newId('region'), tenantId, name: parsed.data.name, slug: parsed.data.slug, isDefault: false }
   await db.insert(regions).values(region)
   return c.json({ region }, 201)
+})
+
+dashboardRoutes.patch('/regions/:regionId', requireRole('admin'), async (c) => {
+  const parsed = nameUpdateSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  const tenantId = c.get('tenant').tenantId
+  const regionId = c.req.param('regionId')
+  const result = await createDb(c.env).update(regions).set({ name: parsed.data.name })
+    .where(and(eq(regions.id, regionId), eq(regions.tenantId, tenantId)))
+  if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  return c.json({ regionId, name: parsed.data.name })
 })
 
 dashboardRoutes.get('/branches', async (c) => {
@@ -229,6 +243,7 @@ dashboardRoutes.post('/pricing-rules', requireRole('admin'), async (c) => {
     id: newId('price-rule'),
     tenantId,
     name: parsed.data.name,
+    deliveryFeeSen: parsed.data.deliveryFeeSen ?? 0,
     isActive: parsed.data.isActive ?? true,
     sortOrder: parsed.data.sortOrder ?? 0,
   }
@@ -309,6 +324,17 @@ dashboardRoutes.post('/branches', requireRole('admin'), async (c) => {
   }
   await db.batch(statements as [any, ...any[]])
   return c.json({ branch: { id: branchId, tenantId, regionId: parsed.data.regionId, name: parsed.data.name, slug: parsed.data.slug, address: parsed.data.address ?? null, deliveryPeriod: parsed.data.deliveryPeriod ?? null, isDefault: makeDefault }, syncedDefault: parsed.data.syncDefault }, 201)
+})
+
+dashboardRoutes.patch('/branches/:branchId', requireRole('admin'), async (c) => {
+  const parsed = nameUpdateSchema.safeParse(await c.req.json().catch(() => null))
+  if (!parsed.success) return c.json({ error: 'invalid_input' }, 400)
+  const tenantId = c.get('tenant').tenantId
+  const branchId = c.req.param('branchId')
+  const result = await createDb(c.env).update(branches).set({ name: parsed.data.name })
+    .where(and(eq(branches.id, branchId), eq(branches.tenantId, tenantId)))
+  if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
+  return c.json({ branchId, name: parsed.data.name })
 })
 
 dashboardRoutes.post('/branches/:branchId/default', requireRole('admin'), async (c) => {
@@ -521,6 +547,8 @@ dashboardRoutes.get('/orders', async (c) => {
       orderNumber: orders.orderNumber,
       status: orders.status,
       totalSen: orders.totalSen,
+      deliveryFeeSenSnapshot: orders.deliveryFeeSenSnapshot,
+      pricingRuleNameSnapshot: orders.pricingRuleNameSnapshot,
       createdAt: orders.createdAt,
       customerName: customers.name,
       customerPhone: customers.phone,
@@ -596,6 +624,8 @@ dashboardRoutes.get('/orders/:orderId', async (c) => {
       orderNumber: orders.orderNumber,
       status: orders.status,
       totalSen: orders.totalSen,
+      deliveryFeeSenSnapshot: orders.deliveryFeeSenSnapshot,
+      pricingRuleNameSnapshot: orders.pricingRuleNameSnapshot,
       createdAt: orders.createdAt,
       remark: orders.remark,
       hasPaymentReceipt: orders.paymentReceiptKey,
@@ -669,6 +699,8 @@ dashboardRoutes.get('/orders/:orderId/pdf', requireRole('staff'), async (c) => {
       orderNumber: orders.orderNumber,
       status: orders.status,
       totalSen: orders.totalSen,
+      deliveryFeeSenSnapshot: orders.deliveryFeeSenSnapshot,
+      pricingRuleNameSnapshot: orders.pricingRuleNameSnapshot,
       createdAt: orders.createdAt,
       customerName: customers.name,
       customerPhone: customers.phone,
@@ -915,22 +947,16 @@ function normalizeEmptyScheduleFields(body: unknown) {
 }
 
 async function buildScheduledMealValues(db: ReturnType<typeof createDb>, tenantId: string, branchId: string | null, data: z.infer<typeof productSchema>) {
-  if (data.kind === 'add_on') return { serviceDate: null, servicePeriod: null, orderCutoffAt: null, weeklyDay: null, weeklyCutoffTime: null, rulePrices: [] as { pricingRuleId: string; priceSen: number }[] }
+  if (data.kind === 'add_on') return { serviceDate: null, servicePeriod: null, orderCutoffAt: null, weeklyDay: null, weeklyCutoffTime: null }
   const recurring = data.kind === 'recurring_meal'
-  if ((!recurring && data.kind !== 'scheduled_meal') || !data.servicePeriod || !data.rulePrices) return null
+  if ((!recurring && data.kind !== 'scheduled_meal') || !data.servicePeriod) return null
   if (recurring ? data.weeklyDay === undefined || !data.weeklyCutoffTime : !data.serviceDate || !data.cutoffMalaysiaTime) return null
-  if (new Set(data.rulePrices.map((price) => price.pricingRuleId)).size !== data.rulePrices.length) return null
 
   const [branchRule] = branchId
     ? await db.select({ id: pricingRules.id }).from(pricingRules).innerJoin(branches, eq(branches.pricingRuleId, pricingRules.id))
       .where(and(eq(branches.id, branchId), eq(branches.tenantId, tenantId), eq(pricingRules.tenantId, tenantId), eq(pricingRules.isActive, true))).limit(1)
     : []
-  if (!branchRule || !data.rulePrices.some((price) => price.pricingRuleId === branchRule.id)) return null
-
-  const activeRules = await db.select({ id: pricingRules.id }).from(pricingRules)
-    .where(and(eq(pricingRules.tenantId, tenantId), eq(pricingRules.isActive, true)))
-  const activeRuleIds = new Set(activeRules.map((rule) => rule.id))
-  if (data.rulePrices.some((price) => !activeRuleIds.has(price.pricingRuleId))) return null
+  if (!branchRule) return null
 
   try {
     return {
@@ -939,7 +965,6 @@ async function buildScheduledMealValues(db: ReturnType<typeof createDb>, tenantI
       orderCutoffAt: recurring ? null : parseMalaysiaCutoff(data.serviceDate!, data.cutoffMalaysiaTime!),
       weeklyDay: recurring ? data.weeklyDay! : null,
       weeklyCutoffTime: recurring ? data.weeklyCutoffTime! : null,
-      rulePrices: data.rulePrices,
     }
   } catch {
     return null
@@ -986,11 +1011,6 @@ dashboardRoutes.post('/products', requireRole('admin'), async (c) => {
     weeklyCutoffTime: schedule?.weeklyCutoffTime ?? null,
   }
   await db.insert(products).values(values)
-  if (schedule?.rulePrices.length) {
-    await db.insert(scheduledMealPrices).values(schedule.rulePrices.map((price) => ({
-      id: newId('scheduled-price'), tenantId, productId: id, ...price,
-    })))
-  }
   return c.json({ product: values }, 201)
 })
 
@@ -1022,12 +1042,6 @@ dashboardRoutes.patch('/products/:productId', requireRole('admin'), async (c) =>
     })
     .where(scoped(products, tenantId, and(branchPredicate(products, branch?.id ?? null), eq(products.id, productId))))
   if (result.meta?.changes !== 1) return c.json({ error: 'not_found' }, 404)
-  if (parsed.data.kind) {
-    await db.delete(scheduledMealPrices).where(and(eq(scheduledMealPrices.tenantId, tenantId), eq(scheduledMealPrices.productId, productId)))
-    if (schedule?.rulePrices.length) await db.insert(scheduledMealPrices).values(schedule.rulePrices.map((price) => ({
-      id: newId('scheduled-price'), tenantId, productId, ...price,
-    })))
-  }
   return c.json({ productId, ...parsed.data })
 })
 

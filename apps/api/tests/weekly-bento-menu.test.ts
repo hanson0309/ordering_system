@@ -111,7 +111,7 @@ describe('scheduled meal pricing', () => {
     expect(isScheduledMealOpen(meal, new Date('2026-10-29T01:00:00.000Z'))).toBe(false)
   })
 
-  it('adds the selected location rule adjustment to the scheduled meal base price', async () => {
+  it('keeps the scheduled meal base price separate from the selected rule delivery fee', async () => {
     const tenantId = await createTenant('Location pricing', 'location-pricing')
     const productId = await createProduct(tenantId, { name: 'Wednesday lunch', priceSen: 1000 })
     const [studentBranch] = await db().select().from(branches).where(eq(branches.tenantId, tenantId)).limit(1)
@@ -126,8 +126,8 @@ describe('scheduled meal pricing', () => {
     const studentRuleId = newId('price-rule')
     const deliveryRuleId = newId('price-rule')
     await db().insert(pricingRules).values([
-      { id: studentRuleId, tenantId, name: 'UPM Student', sortOrder: 0 },
-      { id: deliveryRuleId, tenantId, name: 'Klang Valley Delivery', sortOrder: 1 },
+      { id: studentRuleId, tenantId, name: 'UPM Student', deliveryFeeSen: 0, sortOrder: 0 },
+      { id: deliveryRuleId, tenantId, name: 'Klang Valley Delivery', deliveryFeeSen: 500, sortOrder: 1 },
     ])
     await db().update(branches).set({ pricingRuleId: studentRuleId }).where(eq(branches.id, studentBranch.id))
     await db().update(branches).set({ pricingRuleId: deliveryRuleId }).where(eq(branches.id, deliveryBranchId))
@@ -143,10 +143,10 @@ describe('scheduled meal pricing', () => {
 
     const [meal] = await db().select().from(products).where(eq(products.id, productId))
     await expect(resolveEffectiveProductPrices(db(), tenantId, studentBranch.id, [meal], new Date('2026-10-29T00:00:00.000Z'))).resolves.toEqual([
-      expect.objectContaining({ id: productId, effectivePriceSen: 1000, pricingRuleName: 'UPM Student' }),
+      expect.objectContaining({ id: productId, effectivePriceSen: 1000, deliveryFeeSen: 0, pricingRuleName: 'UPM Student' }),
     ])
     await expect(resolveEffectiveProductPrices(db(), tenantId, deliveryBranchId, [meal], new Date('2026-10-29T00:00:00.000Z'))).resolves.toEqual([
-      expect.objectContaining({ id: productId, effectivePriceSen: 1500, pricingRuleName: 'Klang Valley Delivery' }),
+      expect.objectContaining({ id: productId, effectivePriceSen: 1000, deliveryFeeSen: 500, pricingRuleName: 'Klang Valley Delivery' }),
     ])
   })
 
@@ -155,7 +155,7 @@ describe('scheduled meal pricing', () => {
     const productId = await createProduct(tenantId, { name: 'Thursday lunch', priceSen: 1000 })
     const [branch] = await db().select().from(branches).where(eq(branches.tenantId, tenantId)).limit(1)
     const ruleId = newId('price-rule')
-    await db().insert(pricingRules).values({ id: ruleId, tenantId, name: 'UPM Student', sortOrder: 0 })
+    await db().insert(pricingRules).values({ id: ruleId, tenantId, name: 'UPM Student', deliveryFeeSen: 500, sortOrder: 0 })
     await db().update(branches).set({ pricingRuleId: ruleId }).where(eq(branches.id, branch.id))
     await db().update(products).set({
       serviceDate: '2026-10-29',
@@ -176,11 +176,13 @@ describe('scheduled meal pricing', () => {
       items: [{ productId, quantity: 2 }],
     }, branch.id, new Date('2026-10-29T00:00:00.000Z'))
 
-    expect(order.totalSen).toBe(3700)
+    expect(order.totalSen).toBe(2500)
+    expect(order.deliveryFeeSenSnapshot).toBe(500)
+    expect(order.pricingRuleNameSnapshot).toBe('UPM Student')
     expect(await db().select().from(orderItems).where(eq(orderItems.orderId, order.id))).toMatchObject([
       {
         productNameSnapshot: 'Thursday lunch',
-        unitPriceSenSnapshot: 1850,
+        unitPriceSenSnapshot: 1000,
         serviceDateSnapshot: '2026-10-29',
         servicePeriodSnapshot: 'lunch',
         pricingRuleNameSnapshot: 'UPM Student',
@@ -286,7 +288,7 @@ describe('scheduled meal dashboard API', () => {
     expect(response.status).toBe(201)
   })
 
-  it('creates a scheduled meal with its Malaysia cutoff and location rule price', async () => {
+  it('creates a scheduled meal with its Malaysia cutoff and base price only', async () => {
     const tenantId = await createTenant('Dashboard bento', 'dashboard-bento')
     const userId = await createUser('dashboard-bento@example.com')
     await addMembership(userId, tenantId, 'admin')
@@ -307,7 +309,6 @@ describe('scheduled meal dashboard API', () => {
       body: JSON.stringify({
         name: 'Thai mayo dory rice', priceSen: 1000, categoryId: null, isPublic: true, isAvailable: true,
         kind: 'scheduled_meal', serviceDate: '2026-10-29', servicePeriod: 'lunch', cutoffMalaysiaTime: '09:00',
-        rulePrices: [{ pricingRuleId: pricingRule.id, priceSen: 850 }],
       }),
     })
 
@@ -315,8 +316,6 @@ describe('scheduled meal dashboard API', () => {
     const { product } = await createdMeal.json<{ product: { id: string; serviceDate: string; servicePeriod: string; orderCutoffAt: string } }>()
     expect(product).toMatchObject({ serviceDate: '2026-10-29', servicePeriod: 'lunch' })
     expect(new Date(product.orderCutoffAt).toISOString()).toBe('2026-10-29T01:00:00.000Z')
-    expect(await db().select().from(scheduledMealPrices).where(eq(scheduledMealPrices.productId, product.id))).toMatchObject([
-      { pricingRuleId: pricingRule.id, priceSen: 850 },
-    ])
+    expect(await db().select().from(scheduledMealPrices).where(eq(scheduledMealPrices.productId, product.id))).toEqual([])
   })
 })

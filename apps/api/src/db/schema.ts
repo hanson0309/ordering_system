@@ -76,6 +76,7 @@ export const pricingRules = sqliteTable('pricing_rules', {
   id: text('id').primaryKey(),
   tenantId: text('tenant_id').notNull().references(() => tenants.id),
   name: text('name').notNull(),
+  deliveryFeeSen: integer('delivery_fee_sen').notNull().default(0),
   isActive: integer('is_active', { mode: 'boolean' }).notNull().default(true),
   sortOrder: integer('sort_order').notNull().default(0),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull().default(sql`(unixepoch())`),
@@ -270,6 +271,8 @@ export const orders = sqliteTable('orders', {
   paymentReceiptKey: text('payment_receipt_key'),
   paymentReceiptContentType: text('payment_receipt_content_type'),
   paymentReceiptUploadedAt: integer('payment_receipt_uploaded_at', { mode: 'timestamp' }),
+  deliveryFeeSenSnapshot: integer('delivery_fee_sen_snapshot').notNull().default(0),
+  pricingRuleNameSnapshot: text('pricing_rule_name_snapshot'),
   totalSen: integer('total_sen').notNull(),
   // Protects against duplicate submission from the storefront (e.g. double
   // click / retry). Unique per tenant, supplied by the client at creation

@@ -7,6 +7,8 @@ export interface StoreInfo {
     [key: string]: unknown
   } | null
   paymentQrUrl: string | null
+  pricingRuleName: string | null
+  deliveryFeeSen: number
 }
 
 export interface Category {
@@ -24,12 +26,16 @@ export interface Product {
   serviceDate: string | null
   servicePeriod: 'lunch' | 'dinner' | null
   orderCutoffAt: string | null
+  deliveryFeeSen?: number
+  pricingRuleName?: string | null
 }
 
 export interface CreateOrderResponse {
   orderId: string
   orderNumber: string
   totalSen: number
+  deliveryFeeSen: number
+  pricingRuleName: string | null
   status: string
 }
 

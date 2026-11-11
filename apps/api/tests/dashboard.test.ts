@@ -606,6 +606,47 @@ describe('tenant dashboard', () => {
     expect(wrongTenantRegion.status).toBe(404)
   })
 
+  it('allows admins to rename their regions and stores without changing their slugs', async () => {
+    const tenant = await createTenant('Rename API', 'dashboard-rename-api')
+    const otherTenant = await createTenant('Other Rename API', 'dashboard-other-rename-api')
+    const user = await createUser('dashboard-rename-api@example.com')
+    await addMembership(user, tenant, 'admin')
+    const cookie = await loginAndGetCookie('dashboard-rename-api@example.com')
+    const regionId = 'region-dashboard-rename'
+    const otherRegionId = `region_default_${otherTenant}`
+    const [branch] = await db().insert(branches).values({
+      id: 'branch-dashboard-rename', tenantId: tenant, regionId: `region_default_${tenant}`, name: 'K12', slug: 'k12', isDefault: false,
+    }).returning({ id: branches.id })
+    await db().insert(regions).values({ id: regionId, tenantId: tenant, name: 'Old region', slug: 'old-region' })
+
+    const renamedRegion = await SELF.fetch(`https://test.local/api/dashboard/regions/${regionId}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'UPM' }),
+    })
+    expect(renamedRegion.status).toBe(200)
+    expect(await renamedRegion.json()).toMatchObject({ regionId, name: 'UPM' })
+
+    const renamedBranch = await SELF.fetch(`https://test.local/api/dashboard/branches/${branch.id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'K12 Afternoon' }),
+    })
+    expect(renamedBranch.status).toBe(200)
+    expect(await renamedBranch.json()).toMatchObject({ branchId: branch.id, name: 'K12 Afternoon' })
+
+    const rows = await db().select().from(branches).where(eq(branches.id, branch.id))
+    expect(rows[0]).toMatchObject({ name: 'K12 Afternoon', slug: 'k12' })
+    const regionRows = await db().select().from(regions).where(eq(regions.id, regionId))
+    expect(regionRows[0]).toMatchObject({ name: 'UPM', slug: 'old-region' })
+
+    const crossTenantRegion = await SELF.fetch(`https://test.local/api/dashboard/regions/${otherRegionId}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Hijacked' }),
+    })
+    const otherBranch = (await db().select({ id: branches.id }).from(branches).where(eq(branches.tenantId, otherTenant)).limit(1))[0]
+    const crossTenantBranch = await SELF.fetch(`https://test.local/api/dashboard/branches/${otherBranch.id}`, {
+      method: 'PATCH', headers: { cookie, 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Hijacked' }),
+    })
+    expect(crossTenantRegion.status).toBe(404)
+    expect(crossTenantBranch.status).toBe(404)
+  })
+
   it('allows a store slug to repeat across regions but not within one region', async () => {
     const tenant = await createTenant('Repeated Store Slug', 'dashboard-region-slugs')
     const user = await createUser('dashboard-region-slugs@example.com')

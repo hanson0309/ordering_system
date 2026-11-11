@@ -2,11 +2,11 @@ import { Hono } from 'hono'
 import { and, asc, eq, isNull } from 'drizzle-orm'
 import { z } from 'zod'
 import { createDb } from '../db/client'
-import { branches, categories, orders, products, tenantSettings } from '../db/schema'
+import { branches, categories, orders, products, pricingRules, tenantSettings } from '../db/schema'
 import { scoped } from '../repositories/scoped'
 import { resolvePublicTenant } from '../auth/middleware'
 import { createOrder, OrderValidationError } from '../services/orders'
-import { expandWeeklyProduct, getMalaysiaDate, isScheduledMeal, isWeeklyMeal, resolveEffectiveProductPrices } from '../services/scheduled-meals'
+import { expandWeeklyProduct, getBranchPricingRule, getMalaysiaDate, isScheduledMeal, isWeeklyMeal, resolveEffectiveProductPrices } from '../services/scheduled-meals'
 import type { Env, AppVariables } from '../types'
 import { isUploadFile, uploadErrorResponse, validateUpload } from '../services/uploads'
 
@@ -25,6 +25,9 @@ publicRoutes.get('/', async (c) => {
     .where(eq(tenantSettings.tenantId, tenant.id))
     .limit(1)
   const [qrBranch] = branch ? await db.select({ paymentQrKey: branches.paymentQrKey }).from(branches).where(eq(branches.id, branch.id)).limit(1) : []
+  const [branchPricingRule] = branch ? await db.select({ name: pricingRules.name, deliveryFeeSen: pricingRules.deliveryFeeSen }).from(branches)
+    .innerJoin(pricingRules, and(eq(pricingRules.id, branches.pricingRuleId), eq(pricingRules.tenantId, tenant.id), eq(pricingRules.isActive, true)))
+    .where(and(eq(branches.id, branch.id), eq(branches.tenantId, tenant.id))).limit(1) : []
   const [defaultBranch] = !qrBranch?.paymentQrKey && branch ? await db.select({ id: branches.id, paymentQrKey: branches.paymentQrKey }).from(branches).where(and(eq(branches.regionId, branch.regionId), eq(branches.isDefault, true))).limit(1) : []
   const paymentQrBranchId = qrBranch?.paymentQrKey ? branch?.id : defaultBranch?.paymentQrKey ? defaultBranch.id : null
 
@@ -32,6 +35,8 @@ publicRoutes.get('/', async (c) => {
     name: tenant.name,
     slug: tenant.slug,
     location: branch ? { slug: branch.slug, name: branch.name } : null,
+    pricingRuleName: branchPricingRule?.name ?? null,
+    deliveryFeeSen: branchPricingRule?.deliveryFeeSen ?? 0,
     businessInfo: settings?.businessInfo ?? null,
     paymentQrUrl: paymentQrBranchId && branch ? `/api/public/${tenant.slug}/${branch.regionSlug}/${branch.slug}/payment-qr` : null,
   })
@@ -68,6 +73,7 @@ publicRoutes.get('/products', async (c) => {
   const tenant = c.get('publicTenant')
   const branch = c.get('publicBranch')
   const db = createDb(c.env)
+  const branchPricing = branch ? await getBranchPricingRule(db, tenant.id, branch.id) : null
 
   const rows = await db
     .select({
@@ -100,10 +106,15 @@ publicRoutes.get('/products', async (c) => {
     : []
   return c.json({
     products: [
-      ...ordinaryProducts.map(({ isPublic, isAvailable, weeklyDay, weeklyCutoffTime, ...product }) => product),
-      ...scheduledProducts.map(({ effectivePriceSen, pricingRuleName, isPublic, isAvailable, weeklyDay, weeklyCutoffTime, ...product }) => ({
+      ...ordinaryProducts.map(({ isPublic, isAvailable, weeklyDay, weeklyCutoffTime, ...product }) => ({
+        ...product,
+        deliveryFeeSen: branchPricing?.deliveryFeeSen ?? 0,
+        pricingRuleName: branchPricing?.name ?? null,
+      })),
+      ...scheduledProducts.map(({ effectivePriceSen, pricingRuleName, deliveryFeeSen, isPublic, isAvailable, weeklyDay, weeklyCutoffTime, ...product }) => ({
         ...product,
         priceSen: effectivePriceSen,
+        deliveryFeeSen,
         orderCutoffAt: product.orderCutoffAt?.toISOString() ?? null,
       })),
     ],
@@ -150,6 +161,8 @@ publicRoutes.post('/orders', async (c) => {
         orderId: order.id,
         orderNumber: order.orderNumber,
         totalSen: order.totalSen,
+        deliveryFeeSen: order.deliveryFeeSenSnapshot,
+        pricingRuleName: order.pricingRuleNameSnapshot,
         status: order.status,
       },
       201,

@@ -8,6 +8,8 @@ export interface OrderPdfData {
   orderNumber: string
   status: string
   totalSen: number
+  deliveryFeeSenSnapshot: number
+  pricingRuleNameSnapshot: string | null
   createdAt: Date
   customerName: string
   customerPhone: string
@@ -121,8 +123,13 @@ export async function renderOrderPdf(data: OrderPdfData, options: PdfRenderOptio
     y -= 20
   }
 
-  addPageIfNeeded(48)
+  addPageIfNeeded(66)
   y -= 8
+  if (data.deliveryFeeSenSnapshot > 0) {
+    draw(`Delivery fee${data.pricingRuleNameSnapshot ? ` (${data.pricingRuleNameSnapshot})` : ''}`, 330, 10, regular, rgb(0.38, 0.42, 0.5))
+    draw(money(data.deliveryFeeSenSnapshot), 460, 10)
+    y -= 18
+  }
   page.drawLine({ start: { x: 350, y }, end: { x: pageWidth - margin, y }, thickness: 1, color: rgb(0.75, 0.78, 0.83) })
   y -= 23
   draw('Total', 390, 12, bold)
